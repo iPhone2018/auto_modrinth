@@ -996,7 +996,7 @@ def run_gui():
         log_text.config(state=tk.DISABLED)
 
     def refresh():
-               try:
+        try:
             while True:
                 item = log_queue.get_nowait()
                 if isinstance(item, tuple) and item[0] == "progress":
