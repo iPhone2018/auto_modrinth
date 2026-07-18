@@ -60,18 +60,19 @@ warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
 
 # ====================== 全局配置 ======================
-DEFAULT_THREAD_COUNT = 2
+DEFAULT_THREAD_COUNT = 1
 MAX_COLLECTIONS_PER_USER = 32  # 每个用户最多32个收藏夹
 
 
 def init_browser(task_id: int):
     """
-    跨平台浏览器初始化 - 修复Windows无GPU多开卡死
+    跨平台浏览器初始化
+    Mac：自动读取系统Chrome + 复用项目.wdm缓存驱动
+    Windows：使用根目录chromedriver.exe + 项目内chrome便携包
     """
-    import shutil
-    import tempfile
-
     if getattr(sys, 'frozen', False):
+        # PyInstaller --onefile: sys.executable 是临时目录
+        # 用 sys.argv[0] 获取 exe 真实路径
         base_dir = os.path.dirname(os.path.realpath(sys.argv[0]))
     else:
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -93,65 +94,39 @@ def init_browser(task_id: int):
     print(f"✅ 使用本地 ChromeDriver：{local_driver}")
     print(f"✅ 使用本地 Chrome：{portable_chrome}")
 
-    # ========== 使用临时目录 + 强制清理残留 ==========
-    user_data_dir = os.path.join(tempfile.gettempdir(), f"modrinth_chrome_{task_id}_{int(time.time()*1000)}")
-    if os.path.exists(user_data_dir):
-        try:
-            shutil.rmtree(user_data_dir, ignore_errors=True)
-            time.sleep(0.3)
-        except:
-            pass
-    os.makedirs(user_data_dir, exist_ok=True)
-
-    # 欺骗 SingletonLock
-    try:
-        with open(os.path.join(user_data_dir, "SingletonLock"), "w") as f:
-            f.write("fake_lock")
-    except:
-        pass
-    # =====================================================
-
     options = webdriver.ChromeOptions()
     options.binary_location = portable_chrome
-
-    # 基础参数
+    # ========== 关键修复参数 ==========
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-extensions")
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--start-maximized")
+    options.add_experimental_option("excludeSwitches", ["enable-logging"])
     options.add_argument("--disable-animations")
-    options.add_experimental_option("excludeSwitches", ["enable-logging", "enable-automation"])
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
 
-    # ========== 关键修复：窗口控制（防卡死）==========
-    # 小窗口 + 分散位置，避免GDI竞争
-    x_pos = (task_id % 3) * 400
-    y_pos = (task_id // 3) * 100
-    options.add_argument(f"--window-size=1000,700")
-    options.add_argument(f"--window-position={x_pos},{y_pos}")
-    # ❌ 删除 --start-maximized（最大化吃GDI最多）
-    # ❌ 删除 --disable-background-networking（导致网络死锁）
-    # ❌ 删除 --remote-debugging-port（端口冲突）
+    # ===== 窗口配置：全屏最大化 =====
+    options.add_argument("--start-maximized")
     # =====================================================
 
-    # 无GPU环境参数
-    options.add_argument("--disable-gpu")
-    options.add_argument("--disable-software-rasterizer")
-    options.add_argument("--disable-gpu-sandbox")
-
+    user_data_dir = os.path.join(base_dir, f"chrome_user_data_task_{task_id}")
+    os.makedirs(user_data_dir, exist_ok=True)
     options.add_argument(f"--user-data-dir={user_data_dir}")
+    debug_port = 9222 + task_id * 10
+    options.add_argument(f"--remote-debugging-port={debug_port}")
 
     service = Service(local_driver)
-
-    # 关键：启动间隔，错开桌面堆分配
-    time.sleep(random.uniform(3, 6))
-
     driver = webdriver.Chrome(service=service, options=options)
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-        "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        "source": """
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined})
+            """
     })
     wait = WebDriverWait(driver, 15)
     short_wait = WebDriverWait(driver, 3)
-    return driver, wait, short_wait, user_data_dir
+    return driver, wait, short_wait
 
 
 # ===================== 辅助函数：带重试的点击 =====================
@@ -228,7 +203,6 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
     failed_titles = []   # 记录失败的标题
     failed_intros = []   # 记录失败的简介
     success_count = 0    # 成功创建的收藏夹数
-    user_data_dir = None
 
     try:
         if log_callback:
@@ -238,7 +212,7 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
 
         if log_callback:
             log_callback(f"[用户{task_id}] 初始化 Chrome 浏览器...")
-        driver, wait, short_wait, user_data_dir = init_browser(task_id)
+        driver, wait, short_wait = init_browser(task_id)
         if log_callback:
             log_callback(f"[用户{task_id}] 浏览器初始化成功")
         long_wait = WebDriverWait(driver, 6000)
@@ -577,12 +551,6 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
                 driver.quit()
             except:
                 pass
-        # 清理 user_data_dir
-        if user_data_dir and os.path.exists(user_data_dir):
-            try:
-                shutil.rmtree(user_data_dir, ignore_errors=True)
-            except:
-                pass
 
 
 # ====================================================================
@@ -873,7 +841,6 @@ def run_gui():
     title_dir_var = tk.StringVar(value="")
     intro_dir_var = tk.StringVar(value="")
     output_dir_var = tk.StringVar(value="")
-    thread_count_var = tk.StringVar(value=str(DEFAULT_THREAD_COUNT))
     title_list = []
     intro_list = []
     title_check_vars = {}
@@ -897,15 +864,6 @@ def run_gui():
     # 配置区
     cfg = tk.LabelFrame(main, text="配置选项", font=("微软雅黑", 10, "bold"))
     cfg.pack(fill=tk.X, pady=5)
-
-    # 线程数
-    thread_frame = tk.Frame(cfg)
-    thread_frame.pack(fill=tk.X, pady=5, padx=10)
-    tk.Label(thread_frame, text="并发数:", font=("微软雅黑", 10, "bold"), width=10, anchor=tk.W).pack(side=tk.LEFT)
-    thread_spin = tk.Spinbox(thread_frame, from_=1, to=8, textvariable=thread_count_var,
-                              width=8, font=("微软雅黑", 10))
-    thread_spin.pack(side=tk.LEFT, padx=5)
-    tk.Label(thread_frame, text="（同时启动浏览器数量，建议 3~5）", font=("微软雅黑", 9), fg="#666").pack(side=tk.LEFT)
 
     # 标题目录
     title_dir_frame = tk.Frame(cfg)
@@ -1203,10 +1161,7 @@ def run_gui():
         out_dir = output_dir_var.get()
         os.makedirs(out_dir, exist_ok=True)
 
-        try:
-            tc = int(thread_count_var.get())
-        except ValueError:
-            tc = DEFAULT_THREAD_COUNT
+        tc = DEFAULT_THREAD_COUNT
 
         engine[0] = ModrinthCollector(
             title_files=title_list.copy(),
