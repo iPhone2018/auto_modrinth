@@ -19,6 +19,7 @@ import sys
 import time
 import random
 import string
+import socket
 import requests
 import threading
 import queue
@@ -64,15 +65,59 @@ DEFAULT_THREAD_COUNT = 1
 MAX_COLLECTIONS_PER_USER = 32  # 每个用户最多32个收藏夹
 
 
+def _is_port_in_use(port: int) -> bool:
+    """检查端口是否被占用"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1)
+        return s.connect_ex(('127.0.0.1', port)) == 0
+
+
+def _cleanup_chrome_locks(user_data_dir: str):
+    """清理Chrome用户数据目录中的锁文件，防止启动失败"""
+    lock_files = [
+        "SingletonLock",
+        "SingletonSocket",
+        "SingletonCookie",
+    ]
+    for lock_name in lock_files:
+        lock_path = os.path.join(user_data_dir, lock_name)
+        if os.path.exists(lock_path):
+            try:
+                if os.path.isfile(lock_path):
+                    os.remove(lock_path)
+                elif os.path.islink(lock_path):
+                    os.unlink(lock_path)
+            except Exception:
+                pass
+    # 清理 GPUCache 等缓存目录（可选，解决某些崩溃残留）
+    cache_dirs = ["GPUCache", "Code Cache", "Service Worker"]
+    for cache_name in cache_dirs:
+        cache_path = os.path.join(user_data_dir, cache_name)
+        if os.path.exists(cache_path):
+            try:
+                import shutil
+                shutil.rmtree(cache_path, ignore_errors=True)
+            except Exception:
+                pass
+
+
+def _find_available_port(start_port: int, max_attempts: int = 20) -> int:
+    """从起始端口开始，找一个未被占用的端口"""
+    for offset in range(max_attempts):
+        port = start_port + offset
+        if not _is_port_in_use(port):
+            return port
+    raise RuntimeError(f"无法找到可用端口，已尝试 {max_attempts} 个端口（从 {start_port} 开始）")
+
+
 def init_browser(task_id: int):
     """
-    跨平台浏览器初始化
-    Mac：自动读取系统Chrome + 复用项目.wdm缓存驱动
-    Windows：使用根目录chromedriver.exe + 项目内chrome便携包
+    跨平台浏览器初始化（优化版）
+    - 自动清理残留锁文件
+    - 自动检测并避免端口冲突
+    - 精简启动参数，减少崩溃概率
     """
     if getattr(sys, 'frozen', False):
-        # PyInstaller --onefile: sys.executable 是临时目录
-        # 用 sys.argv[0] 获取 exe 真实路径
         base_dir = os.path.dirname(os.path.realpath(sys.argv[0]))
     else:
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -94,28 +139,46 @@ def init_browser(task_id: int):
     print(f"✅ 使用本地 ChromeDriver：{local_driver}")
     print(f"✅ 使用本地 Chrome：{portable_chrome}")
 
+    # ========== 1. 清理残留锁文件 ==========
+    user_data_dir = os.path.join(base_dir, f"chrome_user_data_task_{task_id}")
+    print(f"🧹 清理用户数据目录锁文件: {user_data_dir}")
+    _cleanup_chrome_locks(user_data_dir)
+    os.makedirs(user_data_dir, exist_ok=True)
+
+    # ========== 2. 查找可用端口（避免冲突） ==========
+    base_port = 9222 + task_id * 100  # 增大间隔，减少冲突
+    debug_port = _find_available_port(base_port)
+    print(f"🔌 使用调试端口: {debug_port}")
+
+    # ========== 3. 精简 Chrome 启动参数（减少崩溃） ==========
     options = webdriver.ChromeOptions()
     options.binary_location = portable_chrome
-    # ========== 关键修复参数 ==========
+
+    # 核心稳定参数
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")  # Windows 建议加，减少GPU相关崩溃
     options.add_argument("--disable-extensions")
-    options.add_argument("--disable-background-networking")
+    options.add_argument("--disable-plugins")
     options.add_argument("--start-maximized")
-    options.add_experimental_option("excludeSwitches", ["enable-logging"])
-    options.add_argument("--disable-animations")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+
+    # 反检测参数
+    options.add_experimental_option("excludeSwitches", ["enable-logging", "enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
 
-    # ===== 窗口配置：全屏最大化 =====
-    options.add_argument("--start-maximized")
-    # =====================================================
-
-    user_data_dir = os.path.join(base_dir, f"chrome_user_data_task_{task_id}")
-    os.makedirs(user_data_dir, exist_ok=True)
+    # 用户数据目录
     options.add_argument(f"--user-data-dir={user_data_dir}")
-    debug_port = 9222 + task_id * 10
     options.add_argument(f"--remote-debugging-port={debug_port}")
+
+    # 资源限制参数（防止内存爆炸）
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--disable-features=TranslateUI")
+    options.add_argument("--disable-breakpad")  # 禁用崩溃报告器
+    options.add_argument("--disable-component-update")  # 禁用组件自动更新
+    options.add_argument("--no-default-browser-check")
+    options.add_argument("--no-first-run")
 
     service = Service(local_driver)
     driver = webdriver.Chrome(service=service, options=options)
@@ -551,6 +614,13 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
                 driver.quit()
             except:
                 pass
+        # 清理该任务的用户数据目录锁文件，避免下次启动失败
+        try:
+            base_dir = os.path.dirname(os.path.realpath(sys.argv[0])) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+            user_data_dir = os.path.join(base_dir, f"chrome_user_data_task_{task_id}")
+            _cleanup_chrome_locks(user_data_dir)
+        except:
+            pass
 
 
 # ====================================================================
