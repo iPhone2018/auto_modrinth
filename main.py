@@ -110,83 +110,55 @@ def _find_available_port(start_port: int, max_attempts: int = 20) -> int:
     raise RuntimeError(f"无法找到可用端口，已尝试 {max_attempts} 个端口（从 {start_port} 开始）")
 
 
-def init_browser(task_id: int):
-    """
-    跨平台浏览器初始化（优化版）
-    - 自动清理残留锁文件
-    - 自动检测并避免端口冲突
-    - 精简启动参数，减少崩溃概率
-    """
+def init_browser(task_id):
+    """使用 exe 同级目录的 chromedriver 和 chrome"""
+    
     if getattr(sys, 'frozen', False):
+        # PyInstaller --onefile: sys.executable 是临时目录
+        # 用 sys.argv[0] 获取 exe 真实路径
         base_dir = os.path.dirname(os.path.realpath(sys.argv[0]))
     else:
         base_dir = os.path.dirname(os.path.abspath(__file__))
-
+    
     local_driver = os.path.join(base_dir, "chromedriver.exe")
     portable_chrome = os.path.join(base_dir, "chrome", "chrome.exe")
-
+    
     print(f"📁 程序目录：{base_dir}")
     print(f"🔍 查找 ChromeDriver：{local_driver}")
     print(f"🔍 查找 Chrome：{portable_chrome}")
-
+    
     if not os.path.exists(local_driver):
         raise FileNotFoundError(f"找不到 chromedriver.exe，请确保与 exe 放在同一目录\n查找路径：{local_driver}")
-
+    
     if not os.path.exists(portable_chrome):
-        raise FileNotFoundError(
-            f"找不到 chrome.exe，请确保 chrome 文件夹与 exe 放在同一目录\n查找路径：{portable_chrome}")
-
+        raise FileNotFoundError(f"找不到 chrome.exe，请确保 chrome 文件夹与 exe 放在同一目录\n查找路径：{portable_chrome}")
+    
     print(f"✅ 使用本地 ChromeDriver：{local_driver}")
     print(f"✅ 使用本地 Chrome：{portable_chrome}")
-
-    # ========== 1. 清理残留锁文件 ==========
-    user_data_dir = os.path.join(base_dir, f"chrome_user_data_task_{task_id}")
-    print(f"🧹 清理用户数据目录锁文件: {user_data_dir}")
-    _cleanup_chrome_locks(user_data_dir)
-    os.makedirs(user_data_dir, exist_ok=True)
-
-    # ========== 2. 查找可用端口（避免冲突） ==========
-    base_port = 9222 + task_id * 100  # 增大间隔，减少冲突
-    debug_port = _find_available_port(base_port)
-    print(f"🔌 使用调试端口: {debug_port}")
-
-    # ========== 3. 精简 Chrome 启动参数（减少崩溃） ==========
+    
     options = webdriver.ChromeOptions()
     options.binary_location = portable_chrome
-
-    # 核心稳定参数
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")  # Windows 建议加，减少GPU相关崩溃
-    options.add_argument("--disable-extensions")
-    options.add_argument("--disable-plugins")
-    options.add_argument("--start-maximized")
-
-    # 反检测参数
-    options.add_experimental_option("excludeSwitches", ["enable-logging", "enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
-
-    # 用户数据目录
+    # ========== 关键修复参数 ==========
+    options.add_argument("--no-sandbox")                    # 禁用沙箱模式（便携版必需）
+    options.add_argument("--disable-dev-shm-usage")         # 禁用 /dev/shm（避免内存问题）
+    options.add_argument("--disable-gpu")                   # 禁用 GPU 加速
+    options.add_argument("--disable-software-rasterizer")   # 禁用软件光栅化
+    options.add_argument("--disable-extensions")           # 禁用扩展
+    options.add_argument("--disable-background-networking") # 禁用后台网络
+    
+    # 指定用户数据目录（解决 DevToolsActivePort 问题）
+    user_data_dir = os.path.join(base_dir, "chrome_user_data")
+    os.makedirs(user_data_dir, exist_ok=True)
     options.add_argument(f"--user-data-dir={user_data_dir}")
-    options.add_argument(f"--remote-debugging-port={debug_port}")
-
-    # 资源限制参数（防止内存爆炸）
-    options.add_argument("--disable-background-networking")
-    options.add_argument("--disable-background-timer-throttling")
-    options.add_argument("--disable-renderer-backgrounding")
-    options.add_argument("--disable-features=TranslateUI")
-    options.add_argument("--disable-breakpad")  # 禁用崩溃报告器
-    options.add_argument("--disable-component-update")  # 禁用组件自动更新
-    options.add_argument("--no-default-browser-check")
-    options.add_argument("--no-first-run")
-
-    service = Service(local_driver)
-    driver = webdriver.Chrome(service=service, options=options)
-    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-        "source": """
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined})
-            """
-    })
+    
+    # 指定远程调试端口（解决 DevToolsActivePort 问题）
+    options.add_argument("--remote-debugging-port=9222")
+    
+    options.add_argument("--start-maximized")
+    options.add_experimental_option("excludeSwitches", ["enable-logging"])
+    options.add_argument("--disable-animations")
+    
+    driver = webdriver.Chrome(service=Service(local_driver), options=options)
     wait = WebDriverWait(driver, 15)
     short_wait = WebDriverWait(driver, 3)
     return driver, wait, short_wait
