@@ -780,7 +780,7 @@ class ModrinthCollector:
                     log_callback=self.log_callback
                 )
                 futures[future] = user_idx
-                time.sleep(1.5)  # 错开启动时间，避免端口冲突
+                time.sleep(10)  # 错开启动时间，避免端口冲突
 
             self._log(f"   已提交 {len(futures)} 个任务，等待执行...")
 
