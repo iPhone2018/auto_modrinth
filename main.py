@@ -336,7 +336,7 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
         print("\n⏳ 等待手动完成 hCaptcha 验证...")
 
         # 等待验证完成（用户手动点击后自动检测）
-        max_wait_time = 300
+        max_wait_time = 600
         poll_interval = 2
         elapsed = 0
         verified = False
