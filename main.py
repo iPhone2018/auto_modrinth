@@ -61,7 +61,7 @@ warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
 
 # ====================== 全局配置 ======================
-DEFAULT_THREAD_COUNT = 1
+DEFAULT_THREAD_COUNT = 3
 MAX_COLLECTIONS_PER_USER = 32  # 每个用户最多32个收藏夹
 
 
@@ -147,12 +147,14 @@ def init_browser(task_id):
     options.add_argument("--disable-background-networking") # 禁用后台网络
     
     # 指定用户数据目录（解决 DevToolsActivePort 问题）
-    user_data_dir = os.path.join(base_dir, "chrome_user_data")
+    user_data_dir = os.path.join(base_dir, f"chrome_user_data_task_{task_id}")
     os.makedirs(user_data_dir, exist_ok=True)
+    _cleanup_chrome_locks(user_data_dir)
     options.add_argument(f"--user-data-dir={user_data_dir}")
     
     # 指定远程调试端口（解决 DevToolsActivePort 问题）
-    options.add_argument("--remote-debugging-port=9222")
+    debug_port = _find_available_port(9222 + task_id)
+    options.add_argument(f"--remote-debugging-port={debug_port}")
     
     options.add_argument("--start-maximized")
     options.add_experimental_option("excludeSwitches", ["enable-logging"])
@@ -822,7 +824,7 @@ class ModrinthCollector:
                     log_callback=self.log_callback
                 )
                 futures[future] = user_idx
-                time.sleep(10)  # 错开启动时间，避免端口冲突
+                time.sleep(2)  # 错开启动时间，避免端口冲突
 
             self._log(f"   已提交 {len(futures)} 个任务，等待执行...")
 
