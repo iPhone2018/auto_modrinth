@@ -5,6 +5,12 @@ Modrinth 批量注册 + 收藏夹管理工具 - GUI版
 
 修复：Windows无GPU环境下多开浏览器卡死问题
 策略：串行启动浏览器 + 最小化 + 并发执行后续流程
+
+修复内容：
+1. 双重driver.quit()保护
+2. 任务完成后从browsers字典移除，防止内存泄漏
+3. 启动失败时进度正确显示
+4. API阶段响应暂停事件
 """
 
 import os
@@ -45,7 +51,6 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.common.action_chains import ActionChains
 from urllib.parse import quote
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
@@ -56,7 +61,7 @@ warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
 
 # ====================== 全局配置 ======================
-DEFAULT_THREAD_COUNT = 2  # 建议2，Windows无GPU环境稳定
+DEFAULT_THREAD_COUNT = 3  # 建议2，Windows无GPU环境稳定
 MAX_COLLECTIONS_PER_USER = 32
 
 # 全局信号量：控制同时"活跃窗口"数量（人工操作hCaptcha时需要）
@@ -294,7 +299,8 @@ def append_link_to_txt(link: str, file_path: str = "links.txt"):
 
 # ===================== 单用户注册 + 创建收藏夹任务 =====================
 def single_user_task(task_id: int, user_titles: list, user_intros: list,
-                     output_dir: str, log_callback=None, browser_tuple=None):
+                     output_dir: str, log_callback=None, browser_tuple=None,
+                     stop_event=None, pause_event=None):
     """
     单个用户完整流程：使用已启动的浏览器 -> 执行注册流程
     browser_tuple: (driver, wait, short_wait, user_data_dir) 如果为None则自行启动
@@ -324,7 +330,7 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
 
         long_wait = WebDriverWait(driver, 6000)
 
-        # ========== 访问目标网址（已预加载则跳过） ==========
+        # ========== 访问目标网址 ==========
         if browser_tuple is None:
             if log_callback:
                 log_callback(f"[用户{task_id}] 访问 modrinth.com...")
@@ -332,7 +338,9 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
             driver.get("https://modrinth.com")
         else:
             if log_callback:
-                log_callback(f"[用户{task_id}] 恢复窗口...")
+                log_callback(f"[用户{task_id}] 访问 modrinth.com...")
+            driver.set_page_load_timeout(30)
+            driver.get("https://modrinth.com")
 
         # 恢复窗口（需要人工操作hCaptcha时）
         with ACTIVE_WINDOW:
@@ -414,7 +422,7 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
             if log_callback:
                 log_callback(f"[用户{task_id}] 生日选择完成")
 
-            # 6. hCaptcha 验证（你的原有代码，不动）
+            # 6. hCaptcha 验证（原有代码，不动）
             hcaptcha_iframe = long_wait.until(
                 EC.presence_of_element_located((
                     By.CSS_SELECTOR,
@@ -551,9 +559,24 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         })
 
-        # 10. 创建收藏夹
+        # 10. 创建收藏夹（支持暂停）
         collection_ids = []
         for i, (title, intro) in enumerate(zip(user_titles, user_intros)):
+            # 检查暂停
+            if pause_event and pause_event.is_set():
+                if log_callback:
+                    log_callback(f"[用户{task_id}] ⏸ 暂停中...")
+                while pause_event.is_set() and (not stop_event or not stop_event.is_set()):
+                    time.sleep(0.5)
+                if log_callback:
+                    log_callback(f"[用户{task_id}] ▶ 继续执行...")
+
+            # 检查停止
+            if stop_event and stop_event.is_set():
+                if log_callback:
+                    log_callback(f"[用户{task_id}] ⏹ 收到停止信号，中断任务")
+                break
+
             if log_callback:
                 log_callback(f"[用户{task_id}] 创建收藏夹 {i+1}/{len(user_titles)}: {title[:30]}...")
 
@@ -577,35 +600,52 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
                 if log_callback:
                     log_callback(f"[用户{task_id}] 创建收藏夹失败: {resp.status_code} - {resp.text[:100]}")
 
-        # 11. 搜索并关注项目
+        # 11. 搜索并关注项目（支持暂停）
         if log_callback:
             log_callback(f"[用户{task_id}] 搜索热门模组...")
-        search_resp = session.get(
-            "https://api.modrinth.com/v2/search",
-            params={"limit": 20, "index": "relevance", "new_filters": "project_types = `mod`"}
-        )
-        time.sleep(random.uniform(0.1, 0.5))
 
-        if search_resp.status_code == 200:
-            hits = search_resp.json().get("hits", [])
-            if hits:
-                target_id = hits[0]['project_id']
-                session.post(f"https://api.modrinth.com/v2/project/{target_id}/follow")
-                if log_callback:
-                    log_callback(f"[用户{task_id}] 已关注项目: {target_id}")
+        # 检查暂停
+        if pause_event and pause_event.is_set():
+            while pause_event.is_set() and (not stop_event or not stop_event.is_set()):
+                time.sleep(0.5)
 
-                # 批量加入收藏
-                for cid in collection_ids:
-                    update_resp = session.patch(
-                        f"https://api.modrinth.com/v3/collection/{cid}",
-                        json={"new_projects": [target_id]}
-                    )
-                    time.sleep(random.uniform(0.1, 0.5))
-                    if update_resp.status_code in [200, 204]:
-                        link = f"https://modrinth.com/collection/{cid}"
-                        append_link_to_txt(link, os.path.join(output_dir, "collection_links.txt"))
-                        if log_callback:
-                            log_callback(f"[用户{task_id}] 项目已加入收藏夹: {cid}")
+        if stop_event and stop_event.is_set():
+            if log_callback:
+                log_callback(f"[用户{task_id}] ⏹ 收到停止信号，跳过后续操作")
+        else:
+            search_resp = session.get(
+                "https://api.modrinth.com/v2/search",
+                params={"limit": 20, "index": "relevance", "new_filters": "project_types = `mod`"}
+            )
+            time.sleep(random.uniform(0.1, 0.5))
+
+            if search_resp.status_code == 200:
+                hits = search_resp.json().get("hits", [])
+                if hits:
+                    target_id = hits[0]['project_id']
+                    session.post(f"https://api.modrinth.com/v2/project/{target_id}/follow")
+                    if log_callback:
+                        log_callback(f"[用户{task_id}] 已关注项目: {target_id}")
+
+                    # 批量加入收藏
+                    for cid in collection_ids:
+                        # 检查暂停
+                        if pause_event and pause_event.is_set():
+                            while pause_event.is_set() and (not stop_event or not stop_event.is_set()):
+                                time.sleep(0.5)
+                        if stop_event and stop_event.is_set():
+                            break
+
+                        update_resp = session.patch(
+                            f"https://api.modrinth.com/v3/collection/{cid}",
+                            json={"new_projects": [target_id]}
+                        )
+                        time.sleep(random.uniform(0.1, 0.5))
+                        if update_resp.status_code in [200, 204]:
+                            link = f"https://modrinth.com/collection/{cid}"
+                            append_link_to_txt(link, os.path.join(output_dir, "collection_links.txt"))
+                            if log_callback:
+                                log_callback(f"[用户{task_id}] 项目已加入收藏夹: {cid}")
 
         if log_callback:
             if failed_titles:
@@ -927,7 +967,9 @@ class ModrinthCollector:
                     user_intros=user_intros,
                     output_dir=self.output_dir,
                     log_callback=self.log_callback,
-                    browser_tuple=self.browsers[task_id]
+                    browser_tuple=self.browsers[task_id],
+                    stop_event=self.stop_event,
+                    pause_event=self.pause_event
                 )
                 futures[future] = task_id
 
@@ -959,17 +1001,23 @@ class ModrinthCollector:
             self._log("   正在关闭线程池...")
             executor.shutdown(wait=False)
 
-            # 清理残留浏览器
-            for task_id, (driver, _, _, user_data_dir) in self.browsers.items():
+            # 清理残留浏览器（带try/except防止双重quit报错）
+            for task_id, browser_info in list(self.browsers.items()):
                 try:
-                    driver.quit()
-                except:
-                    pass
-                if user_data_dir and os.path.exists(user_data_dir):
+                    driver, _, _, user_data_dir = browser_info
                     try:
-                        shutil.rmtree(user_data_dir, ignore_errors=True)
+                        driver.quit()
                     except:
                         pass
+                    if user_data_dir and os.path.exists(user_data_dir):
+                        try:
+                            shutil.rmtree(user_data_dir, ignore_errors=True)
+                        except:
+                            pass
+                except:
+                    pass
+                # 移除引用，释放内存
+                self.browsers.pop(task_id, None)
 
             self._log("   线程池已关闭")
 
@@ -1032,10 +1080,10 @@ def run_gui():
     thread_frame = tk.Frame(cfg)
     thread_frame.pack(fill=tk.X, pady=5, padx=10)
     tk.Label(thread_frame, text="并发数:", font=("微软雅黑", 10, "bold"), width=10, anchor=tk.W).pack(side=tk.LEFT)
-    thread_spin = tk.Spinbox(thread_frame, from_=1, to=5, textvariable=thread_count_var,
+    thread_spin = tk.Spinbox(thread_frame, from_=1, to=8, textvariable=thread_count_var,
                               width=8, font=("微软雅黑", 10))
     thread_spin.pack(side=tk.LEFT, padx=5)
-    tk.Label(thread_frame, text="（Windows无GPU建议2，已启动浏览器后并发执行）", font=("微软雅黑", 9), fg="#666").pack(side=tk.LEFT)
+    tk.Label(thread_frame, text="（建议3-5，Windows无GPU环境串行启动后并发执行）", font=("微软雅黑", 9), fg="#666").pack(side=tk.LEFT)
 
     # 标题目录
     title_dir_frame = tk.Frame(cfg)
@@ -1335,7 +1383,7 @@ def run_gui():
 
         try:
             tc = int(thread_count_var.get())
-            if tc > 5:
+            if tc > 8:
                 tc = 5  # 限制最大5
             if tc < 1:
                 tc = 1
