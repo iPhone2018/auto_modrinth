@@ -55,15 +55,14 @@ from selenium.webdriver.common.action_chains import ActionChains
 from urllib.parse import quote
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
-
 # 屏蔽证书警告
 warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
-
 # ====================== 全局配置 ======================
-DEFAULT_THREAD_COUNT = 3
+# DEFAULT_THREAD_COUNT = 3
 MAX_COLLECTIONS_PER_USER = 32  # 每个用户最多32个收藏夹
-
+# 追加写入锁，防止多线程同时写同一个 txt 冲突
+_file_write_lock = threading.Lock()
 
 def _is_port_in_use(port: int) -> bool:
     """检查端口是否被占用"""
@@ -112,54 +111,55 @@ def _find_available_port(start_port: int, max_attempts: int = 20) -> int:
 
 def init_browser(task_id):
     """使用 exe 同级目录的 chromedriver 和 chrome"""
-    
+
     if getattr(sys, 'frozen', False):
         # PyInstaller --onefile: sys.executable 是临时目录
         # 用 sys.argv[0] 获取 exe 真实路径
         base_dir = os.path.dirname(os.path.realpath(sys.argv[0]))
     else:
         base_dir = os.path.dirname(os.path.abspath(__file__))
-    
+
     local_driver = os.path.join(base_dir, "chromedriver.exe")
     portable_chrome = os.path.join(base_dir, "chrome", "chrome.exe")
-    
+
     print(f"📁 程序目录：{base_dir}")
     print(f"🔍 查找 ChromeDriver：{local_driver}")
     print(f"🔍 查找 Chrome：{portable_chrome}")
-    
+
     if not os.path.exists(local_driver):
         raise FileNotFoundError(f"找不到 chromedriver.exe，请确保与 exe 放在同一目录\n查找路径：{local_driver}")
-    
+
     if not os.path.exists(portable_chrome):
-        raise FileNotFoundError(f"找不到 chrome.exe，请确保 chrome 文件夹与 exe 放在同一目录\n查找路径：{portable_chrome}")
-    
+        raise FileNotFoundError(
+            f"找不到 chrome.exe，请确保 chrome 文件夹与 exe 放在同一目录\n查找路径：{portable_chrome}")
+
     print(f"✅ 使用本地 ChromeDriver：{local_driver}")
     print(f"✅ 使用本地 Chrome：{portable_chrome}")
-    
+
     options = webdriver.ChromeOptions()
     options.binary_location = portable_chrome
     # ========== 关键修复参数 ==========
-    options.add_argument("--no-sandbox")                    # 禁用沙箱模式（便携版必需）
-    options.add_argument("--disable-dev-shm-usage")         # 禁用 /dev/shm（避免内存问题）
-    options.add_argument("--disable-gpu")                   # 禁用 GPU 加速
-    options.add_argument("--disable-software-rasterizer")   # 禁用软件光栅化
-    options.add_argument("--disable-extensions")           # 禁用扩展
-    options.add_argument("--disable-background-networking") # 禁用后台网络
-    
+    options.add_argument("--no-sandbox")  # 禁用沙箱模式（便携版必需）
+    options.add_argument("--disable-dev-shm-usage")  # 禁用 /dev/shm（避免内存问题）
+    options.add_argument("--disable-gpu")  # 禁用 GPU 加速
+    options.add_argument("--disable-software-rasterizer")  # 禁用软件光栅化
+    options.add_argument("--disable-extensions")  # 禁用扩展
+    options.add_argument("--disable-background-networking")  # 禁用后台网络
+
     # 指定用户数据目录（解决 DevToolsActivePort 问题）
     user_data_dir = os.path.join(base_dir, f"chrome_user_data_task_{task_id}")
     os.makedirs(user_data_dir, exist_ok=True)
     _cleanup_chrome_locks(user_data_dir)
     options.add_argument(f"--user-data-dir={user_data_dir}")
-    
+
     # 指定远程调试端口（解决 DevToolsActivePort 问题）
     debug_port = _find_available_port(9222 + task_id)
     options.add_argument(f"--remote-debugging-port={debug_port}")
-    
+
     options.add_argument("--start-maximized")
     options.add_experimental_option("excludeSwitches", ["enable-logging"])
     options.add_argument("--disable-animations")
-    
+
     driver = webdriver.Chrome(service=Service(local_driver), options=options)
     wait = WebDriverWait(driver, 15)
     short_wait = WebDriverWait(driver, 3)
@@ -208,7 +208,7 @@ def random_qq_email():
 
 def display_width(text):
     """中文/全角字符按2宽度计算，其余按1宽度计算"""
-    return sum(2 if unicodedata.east_asian_width(c) in ('F','W') else 1 for c in str(text or ''))
+    return sum(2 if unicodedata.east_asian_width(c) in ('F', 'W') else 1 for c in str(text or ''))
 
 
 def auto_fit_columns(ws, min_w=8, max_w=50, padding=3):
@@ -221,8 +221,9 @@ def auto_fit_columns(ws, min_w=8, max_w=50, padding=3):
 
 def append_link_to_txt(link: str, file_path: str = "links.txt"):
     """将单个链接追加写入txt文件"""
-    with open(file_path, "a", encoding="utf-8") as f:
-        f.write(link + "\n")
+    with _file_write_lock:
+        with open(file_path, "a", encoding="utf-8") as f:
+            f.write(link + "\n")
 
 
 # ===================== 单用户注册 + 创建收藏夹任务 =====================
@@ -237,9 +238,9 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
     driver = None
     session = None
     token = None
-    failed_titles = []   # 记录失败的标题
-    failed_intros = []   # 记录失败的简介
-    success_count = 0    # 成功创建的收藏夹数
+    failed_titles = []  # 记录失败的标题
+    failed_intros = []  # 记录失败的简介
+    success_count = 0  # 成功创建的收藏夹数
 
     try:
         if log_callback:
@@ -479,7 +480,7 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
         collection_ids = []
         for i, (title, intro) in enumerate(zip(user_titles, user_intros)):
             if log_callback:
-                log_callback(f"[用户{task_id}] 创建收藏夹 {i+1}/{len(user_titles)}: {title[:30]}...")
+                log_callback(f"[用户{task_id}] 创建收藏夹 {i + 1}/{len(user_titles)}: {title[:30]}...")
 
             create_payload = {
                 "name": title,
@@ -558,12 +559,13 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
             try:
                 failed_title_path = os.path.join(output_dir, "失败标题.txt")
                 failed_intro_path = os.path.join(output_dir, "失败简介.txt")
-                with open(failed_title_path, "a", encoding="utf-8") as ft:
-                    for t in failed_titles:
-                        ft.write(t + "\n")
-                with open(failed_intro_path, "a", encoding="utf-8") as fi:
-                    for intro in failed_intros:
-                        fi.write(intro + "\n")
+                with _file_write_lock:
+                    with open(failed_title_path, "a", encoding="utf-8") as ft:
+                        for t in failed_titles:
+                            ft.write(t + "\n")
+                    with open(failed_intro_path, "a", encoding="utf-8") as fi:
+                        for intro in failed_intros:
+                            fi.write(intro + "\n")
                 if log_callback:
                     log_callback(f"[用户{task_id}] 已写入 {len(failed_titles)} 条失败记录到 {output_dir}")
             except Exception as write_err:
@@ -590,7 +592,9 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
                 pass
         # 清理该任务的用户数据目录锁文件，避免下次启动失败
         try:
-            base_dir = os.path.dirname(os.path.realpath(sys.argv[0])) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+            base_dir = os.path.dirname(os.path.realpath(sys.argv[0])) if getattr(sys, 'frozen',
+                                                                                 False) else os.path.dirname(
+                os.path.abspath(__file__))
             user_data_dir = os.path.join(base_dir, f"chrome_user_data_task_{task_id}")
             _cleanup_chrome_locks(user_data_dir)
         except:
@@ -909,11 +913,23 @@ def run_gui():
     cfg = tk.LabelFrame(main, text="配置选项", font=("微软雅黑", 10, "bold"))
     cfg.pack(fill=tk.X, pady=5)
 
+    # 线程数配置
+    thread_frame = tk.Frame(cfg)
+    thread_frame.pack(fill=tk.X, pady=5, padx=10)
+    tk.Label(thread_frame, text="浏览器数:", font=("微软雅黑", 10, "bold"), width=10, anchor=tk.W).pack(side=tk.LEFT)
+    thread_spin = tk.Spinbox(thread_frame, from_=1, to=6, width=8, font=("微软雅黑", 10))
+    thread_spin.pack(side=tk.LEFT, padx=5)
+    tk.Label(thread_frame, text="(同时打开的最大浏览器数量，建议 1~6)", font=("微软雅黑", 9), fg="#666").pack(
+        side=tk.LEFT)
+    thread_spin.delete(0, tk.END)
+    thread_spin.insert(0, "3")
+
     # 标题目录
     title_dir_frame = tk.Frame(cfg)
     title_dir_frame.pack(fill=tk.X, pady=5, padx=10)
     tk.Label(title_dir_frame, text="标题目录:", font=("微软雅黑", 10, "bold"), width=10, anchor=tk.W).pack(side=tk.LEFT)
-    tk.Entry(title_dir_frame, textvariable=title_dir_var, width=50, font=("微软雅黑", 9), state="readonly").pack(side=tk.LEFT, padx=5)
+    tk.Entry(title_dir_frame, textvariable=title_dir_var, width=50, font=("微软雅黑", 9), state="readonly").pack(
+        side=tk.LEFT, padx=5)
 
     def choose_title_dir():
         d = filedialog.askdirectory(title="选择标题文件所在目录")
@@ -928,7 +944,8 @@ def run_gui():
     intro_dir_frame = tk.Frame(cfg)
     intro_dir_frame.pack(fill=tk.X, pady=5, padx=10)
     tk.Label(intro_dir_frame, text="简介目录:", font=("微软雅黑", 10, "bold"), width=10, anchor=tk.W).pack(side=tk.LEFT)
-    tk.Entry(intro_dir_frame, textvariable=intro_dir_var, width=50, font=("微软雅黑", 9), state="readonly").pack(side=tk.LEFT, padx=5)
+    tk.Entry(intro_dir_frame, textvariable=intro_dir_var, width=50, font=("微软雅黑", 9), state="readonly").pack(
+        side=tk.LEFT, padx=5)
 
     def choose_intro_dir():
         d = filedialog.askdirectory(title="选择简介文件所在目录")
@@ -942,8 +959,10 @@ def run_gui():
     # 输出目录
     output_dir_frame = tk.Frame(cfg)
     output_dir_frame.pack(fill=tk.X, pady=5, padx=10)
-    tk.Label(output_dir_frame, text="输出目录:", font=("微软雅黑", 10, "bold"), width=10, anchor=tk.W).pack(side=tk.LEFT)
-    tk.Entry(output_dir_frame, textvariable=output_dir_var, width=50, font=("微软雅黑", 9), state="readonly").pack(side=tk.LEFT, padx=5)
+    tk.Label(output_dir_frame, text="输出目录:", font=("微软雅黑", 10, "bold"), width=10, anchor=tk.W).pack(
+        side=tk.LEFT)
+    tk.Entry(output_dir_frame, textvariable=output_dir_var, width=50, font=("微软雅黑", 9), state="readonly").pack(
+        side=tk.LEFT, padx=5)
 
     def choose_output_dir():
         d = filedialog.askdirectory(title="选择结果文件存放目录")
@@ -958,7 +977,8 @@ def run_gui():
     files_frame.pack(fill=tk.X, pady=5)
 
     # 标题文件列表
-    title_list_frame = tk.LabelFrame(files_frame, text="标题文件列表（勾选添加）", font=("微软雅黑", 10, "bold"), height=200)
+    title_list_frame = tk.LabelFrame(files_frame, text="标题文件列表（勾选添加）", font=("微软雅黑", 10, "bold"),
+                                     height=200)
     title_list_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
     title_list_frame.pack_propagate(False)
 
@@ -976,7 +996,8 @@ def run_gui():
     title_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
     # 简介文件列表
-    intro_list_frame = tk.LabelFrame(files_frame, text="简介文件列表（勾选添加）", font=("微软雅黑", 10, "bold"), height=200)
+    intro_list_frame = tk.LabelFrame(files_frame, text="简介文件列表（勾选添加）", font=("微软雅黑", 10, "bold"),
+                                     height=200)
     intro_list_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
     intro_list_frame.pack_propagate(False)
 
@@ -1205,7 +1226,14 @@ def run_gui():
         out_dir = output_dir_var.get()
         os.makedirs(out_dir, exist_ok=True)
 
-        tc = DEFAULT_THREAD_COUNT
+        # tc = DEFAULT_THREAD_COUNT
+        try:
+            tc = int(thread_spin.get())
+            if not 1 <= tc <= 6:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("错误", "浏览器数量必须是 1~6 的整数")
+            return
 
         engine[0] = ModrinthCollector(
             title_files=title_list.copy(),
