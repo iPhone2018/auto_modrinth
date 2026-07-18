@@ -2,16 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 Modrinth 批量注册 + 收藏夹管理工具 - GUI版
-
-功能：
-- 选择标题目录（必选，展示目录内所有txt文件，支持勾选）
-- 选择简介目录（必选，展示目录内所有txt文件，支持勾选）
-- 选择结果文件存放目录（必选）
-- 线程数配置（同时启动浏览器数量）
-- 自动分析：标题/简介数量 -> 计算需要多少用户（随机邮箱）
-- 每个用户创建32个收藏夹，标题不重复，每个收藏夹1标题+1简介
-- 启动/暂停/继续按钮
-- 实时日志显示（带滚动）
 """
 
 import os
@@ -55,29 +45,44 @@ from selenium.webdriver.common.action_chains import ActionChains
 from urllib.parse import quote
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
-# 屏蔽证书警告
 warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
-# ====================== 全局配置 ======================
-# DEFAULT_THREAD_COUNT = 3
-MAX_COLLECTIONS_PER_USER = 32  # 每个用户最多32个收藏夹
-# 追加写入锁，防止多线程同时写同一个 txt 冲突
+MAX_COLLECTIONS_PER_USER = 32
 _file_write_lock = threading.Lock()
 
+_active_drivers = {}
+_drivers_lock = threading.Lock()
+
+
+def register_driver(task_id, driver):
+    with _drivers_lock:
+        _active_drivers[task_id] = driver
+
+
+def unregister_driver(task_id):
+    with _drivers_lock:
+        _active_drivers.pop(task_id, None)
+
+
+def close_all_drivers():
+    with _drivers_lock:
+        drivers = list(_active_drivers.values())
+        _active_drivers.clear()
+    for driver in drivers:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+
 def _is_port_in_use(port: int) -> bool:
-    """检查端口是否被占用"""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(1)
         return s.connect_ex(('127.0.0.1', port)) == 0
 
 
 def _cleanup_chrome_locks(user_data_dir: str):
-    """清理Chrome用户数据目录中的锁文件，防止启动失败"""
-    lock_files = [
-        "SingletonLock",
-        "SingletonSocket",
-        "SingletonCookie",
-    ]
+    lock_files = ["SingletonLock", "SingletonSocket", "SingletonCookie"]
     for lock_name in lock_files:
         lock_path = os.path.join(user_data_dir, lock_name)
         if os.path.exists(lock_path):
@@ -88,7 +93,6 @@ def _cleanup_chrome_locks(user_data_dir: str):
                     os.unlink(lock_path)
             except Exception:
                 pass
-    # 清理 GPUCache 等缓存目录（可选，解决某些崩溃残留）
     cache_dirs = ["GPUCache", "Code Cache", "Service Worker"]
     for cache_name in cache_dirs:
         cache_path = os.path.join(user_data_dir, cache_name)
@@ -101,7 +105,6 @@ def _cleanup_chrome_locks(user_data_dir: str):
 
 
 def _find_available_port(start_port: int, max_attempts: int = 20) -> int:
-    """从起始端口开始，找一个未被占用的端口"""
     for offset in range(max_attempts):
         port = start_port + offset
         if not _is_port_in_use(port):
@@ -110,11 +113,7 @@ def _find_available_port(start_port: int, max_attempts: int = 20) -> int:
 
 
 def init_browser(task_id):
-    """使用 exe 同级目录的 chromedriver 和 chrome"""
-
     if getattr(sys, 'frozen', False):
-        # PyInstaller --onefile: sys.executable 是临时目录
-        # 用 sys.argv[0] 获取 exe 真实路径
         base_dir = os.path.dirname(os.path.realpath(sys.argv[0]))
     else:
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -138,21 +137,18 @@ def init_browser(task_id):
 
     options = webdriver.ChromeOptions()
     options.binary_location = portable_chrome
-    # ========== 关键修复参数 ==========
-    options.add_argument("--no-sandbox")  # 禁用沙箱模式（便携版必需）
-    options.add_argument("--disable-dev-shm-usage")  # 禁用 /dev/shm（避免内存问题）
-    options.add_argument("--disable-gpu")  # 禁用 GPU 加速
-    options.add_argument("--disable-software-rasterizer")  # 禁用软件光栅化
-    options.add_argument("--disable-extensions")  # 禁用扩展
-    options.add_argument("--disable-background-networking")  # 禁用后台网络
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-background-networking")
 
-    # 指定用户数据目录（解决 DevToolsActivePort 问题）
     user_data_dir = os.path.join(base_dir, f"chrome_user_data_task_{task_id}")
     os.makedirs(user_data_dir, exist_ok=True)
     _cleanup_chrome_locks(user_data_dir)
     options.add_argument(f"--user-data-dir={user_data_dir}")
 
-    # 指定远程调试端口（解决 DevToolsActivePort 问题）
     debug_port = _find_available_port(9222 + task_id)
     options.add_argument(f"--remote-debugging-port={debug_port}")
 
@@ -166,31 +162,25 @@ def init_browser(task_id):
     return driver, wait, short_wait
 
 
-# ===================== 辅助函数：带重试的点击 =====================
 def retry_click(driver, element, max_retries=3, delay=0.5):
-    """带重试的点击，依次尝试原生click、ActionChains、JS click"""
     from selenium.webdriver.common.action_chains import ActionChains
     last_error = None
     for attempt in range(max_retries):
         try:
-            # 确保元素在视图中
             driver.execute_script(
                 "arguments[0].scrollIntoView({block: 'center', inline: 'center'});", element
             )
             time.sleep(0.2)
-            # 方式1: 原生 click
             element.click()
             return True
         except Exception as e1:
             last_error = e1
             try:
-                # 方式2: ActionChains
                 ActionChains(driver).move_to_element(element).click().perform()
                 return True
             except Exception as e2:
                 last_error = e2
                 try:
-                    # 方式3: JS click
                     driver.execute_script("arguments[0].click();", element)
                     return True
                 except Exception as e3:
@@ -200,14 +190,12 @@ def retry_click(driver, element, max_retries=3, delay=0.5):
 
 
 def random_qq_email():
-    """生成随机QQ邮箱：8位大小写字母+数字"""
     chars = string.ascii_letters + string.digits
     prefix = ''.join(random.choice(chars) for _ in range(8))
     return f"{prefix}@qq.com"
 
 
 def display_width(text):
-    """中文/全角字符按2宽度计算，其余按1宽度计算"""
     return sum(2 if unicodedata.east_asian_width(c) in ('F', 'W') else 1 for c in str(text or ''))
 
 
@@ -220,27 +208,17 @@ def auto_fit_columns(ws, min_w=8, max_w=50, padding=3):
 
 
 def append_link_to_txt(link: str, file_path: str = "links.txt"):
-    """将单个链接追加写入txt文件"""
     with _file_write_lock:
         with open(file_path, "a", encoding="utf-8") as f:
             f.write(link + "\n")
 
 
-# ===================== 单用户注册 + 创建收藏夹任务 =====================
 def single_user_task(task_id: int, user_titles: list, user_intros: list,
-                     output_dir: str, log_callback=None):
-    """
-    单个用户完整流程：注册 -> 创建收藏夹 -> 添加内容
-    task_id: 浏览器实例编号
-    user_titles: 该用户需要创建的收藏夹标题列表
-    user_intros: 对应的简介列表
-    """
+                     output_dir: str, log_callback=None, on_collection_created=None):
     driver = None
     session = None
     token = None
-    failed_titles = []  # 记录失败的标题
-    failed_intros = []  # 记录失败的简介
-    success_count = 0  # 成功创建的收藏夹数
+    success_count = 0
 
     try:
         if log_callback:
@@ -251,11 +229,11 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
         if log_callback:
             log_callback(f"[用户{task_id}] 初始化 Chrome 浏览器...")
         driver, wait, short_wait = init_browser(task_id)
+        register_driver(task_id, driver)
         if log_callback:
             log_callback(f"[用户{task_id}] 浏览器初始化成功")
         long_wait = WebDriverWait(driver, 6000)
 
-        # 1. 打开网站并注册
         driver.get("https://modrinth.com")
         signup_btn = long_wait.until(EC.element_to_be_clickable((By.XPATH, '//a[@href="/auth/sign-up"]')))
         if not retry_click(driver, signup_btn):
@@ -263,7 +241,6 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
         if log_callback:
             log_callback(f"[用户{task_id}] 点击注册按钮")
 
-        # 2. 输入随机邮箱
         email_input = long_wait.until(EC.visibility_of_element_located((By.ID, "email")))
         random_email = random_qq_email()
         email_input.clear()
@@ -271,14 +248,12 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
         if log_callback:
             log_callback(f"[用户{task_id}] 输入随机邮箱: {random_email}")
 
-        # 3. 输入密码
         pwd_input = long_wait.until(EC.visibility_of_element_located((By.ID, "password")))
         pwd_input.clear()
         pwd_input.send_keys("Admin@coc1")
         if log_callback:
             log_callback(f"[用户{task_id}] 输入密码")
 
-        # 4. 点击 Continue with Email
         continue_btn = long_wait.until(
             EC.element_to_be_clickable(
                 (By.XPATH, "//button[contains(text(), 'Continue with Email')]")
@@ -289,7 +264,6 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
         if log_callback:
             log_callback(f"[用户{task_id}] 点击 Continue with Email")
 
-        # 5. 选择生日
         picker_wrap = long_wait.until(EC.element_to_be_clickable((By.CLASS_NAME, "modrinth-date-picker")))
         if not retry_click(driver, picker_wrap):
             raise Exception(f"点击日期选择器失败")
@@ -330,7 +304,6 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
         if log_callback:
             log_callback(f"[用户{task_id}] 生日选择完成")
 
-        # 6. hCaptcha 验证
         hcaptcha_iframe = long_wait.until(
             EC.presence_of_element_located((
                 By.CSS_SELECTOR,
@@ -339,41 +312,29 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
         )
 
         print(f"[hCaptcha] 发现 checkbox iframe")
-
-        # 切换到 iframe 内部上下文
         driver.switch_to.frame(hcaptcha_iframe)
         print("[hCaptcha] 已切换到 iframe 内部")
 
-        # Step 2: 等待并点击 checkbox（在 iframe 内部）
         checkbox = long_wait.until(
             EC.presence_of_element_located((By.ID, "checkbox"))
         )
-
-        # 滚动到视口中心
         driver.execute_script(
             "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
             checkbox
         )
         time.sleep(0.3)
-
-        # 打印点击前状态
         print(f"[hCaptcha] 点击前 aria-checked: {checkbox.get_attribute('aria-checked')}")
 
-        # Step 3: 使用 ActionChains 模拟真实鼠标点击（比 JS click 更真实）
         actions = ActionChains(driver)
         actions.move_to_element(checkbox)
         actions.click()
         actions.perform()
-
         print("✅ [hCaptcha] ActionChains 点击完成")
 
-        # Step 4: 切回主文档，等待验证结果
         driver.switch_to.default_content()
         print("[hCaptcha] 已切回主文档")
-
         print("\n⏳ 等待手动完成 hCaptcha 验证...")
 
-        # 等待验证完成（用户手动点击后自动检测）
         max_wait_time = 600
         poll_interval = 2
         elapsed = 0
@@ -383,16 +344,13 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
             time.sleep(poll_interval)
             elapsed += poll_interval
 
-            # 检测 hCaptcha 是否已通过
             try:
-                # 方法1: 检查 checkbox iframe 是否还在
                 checkbox_iframes = driver.find_elements(
                     By.CSS_SELECTOR,
                     "iframe[src*='newassets.hcaptcha.com'][src*='frame=checkbox']"
                 )
 
                 if checkbox_iframes:
-                    # iframe 还在，检查 checkbox 状态
                     driver.switch_to.frame(checkbox_iframes[0])
                     try:
                         cb = driver.find_element(By.ID, "checkbox")
@@ -402,17 +360,13 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
                         pass
                     driver.switch_to.default_content()
                 else:
-                    # checkbox iframe 消失了，可能已验证通过
-                    # 检查是否有 challenge iframe（图片验证）
                     challenge_iframes = driver.find_elements(
                         By.CSS_SELECTOR,
                         "iframe[src*='newassets.hcaptcha.com'][src*='frame=challenge']"
                     )
                     if not challenge_iframes:
-                        # 两种 iframe 都不在了，大概率已通过
                         verified = True
                     else:
-                        # 有图片挑战，等用户完成
                         if int(elapsed) % 10 == 0 and log_callback:
                             log_callback(f"[用户{task_id}]    ...等待完成图片挑战...")
                         driver.switch_to.default_content()
@@ -433,7 +387,6 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
         else:
             raise TimeoutError("hCaptcha 验证等待超时（5分钟未检测到通过）")
 
-        # 7. 勾选邮件订阅 + 完成注册
         keep_check = long_wait.until(
             EC.element_to_be_clickable((By.XPATH, '//span[contains(@class, "checkbox-shadow")]'))
         )
@@ -449,7 +402,6 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
             log_callback(f"[用户{task_id}] 注册完成!")
         time.sleep(5)
 
-        # 8. 提取 Token
         cookies = driver.get_cookies()
         for ck in cookies:
             if ck["name"] == "auth-token":
@@ -460,7 +412,6 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
         if log_callback:
             log_callback(f"[用户{task_id}] 获取 Token 成功")
 
-        # 9. 创建 requests session
         retry_strategy = Retry(
             total=5, backoff_factor=1,
             status_forcelist=[429, 500, 502, 503, 504],
@@ -476,7 +427,6 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
         })
 
-        # 10. 创建收藏夹
         collection_ids = []
         for i, (title, intro) in enumerate(zip(user_titles, user_intros)):
             if log_callback:
@@ -494,15 +444,14 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
                 collection_id = resp.json()["id"]
                 collection_ids.append(collection_id)
                 success_count += 1
+                if on_collection_created:
+                    on_collection_created(title)
                 if log_callback:
                     log_callback(f"[用户{task_id}] 收藏夹创建成功! ID: {collection_id}")
             else:
-                failed_titles.append(title)
-                failed_intros.append(intro)
                 if log_callback:
                     log_callback(f"[用户{task_id}] 创建收藏夹失败: {resp.status_code} - {resp.text}")
 
-        # 11. 搜索并关注项目
         if log_callback:
             log_callback(f"[用户{task_id}] 搜索热门模组...")
         search_resp = session.get(
@@ -519,7 +468,6 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
                 if log_callback:
                     log_callback(f"[用户{task_id}] 已关注项目: {target_id}")
 
-                # 批量加入收藏
                 for cid in collection_ids:
                     update_resp = session.patch(
                         f"https://api.modrinth.com/v3/collection/{cid}",
@@ -533,48 +481,18 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
                             log_callback(f"[用户{task_id}] 项目已加入收藏夹: {cid}")
 
         if log_callback:
-            if failed_titles:
-                log_callback(f"[用户{task_id}] 部分完成! 成功 {success_count} 个, 失败 {len(failed_titles)} 个收藏夹")
-            else:
-                log_callback(f"[用户{task_id}] 全部完成! 创建了 {len(collection_ids)} 个收藏夹")
+            log_callback(f"[用户{task_id}] 全部完成! 创建了 {success_count} 个收藏夹")
         return f"用户{task_id} 成功 {success_count}/{len(user_titles)}"
 
     except Exception as e:
-        import traceback
-        error_msg = f"[用户{task_id}] 错误: {str(e)}\n{traceback.format_exc()}"
+        error_msg = f"[用户{task_id}] 错误: {str(e)}"
         if log_callback:
             log_callback(error_msg)
         else:
             print(error_msg)
-
-        # 只将实际失败的标题和简介写入失败文件
-        # failed_titles/failed_intros 在创建收藏夹循环中已记录
-        # 注册阶段失败：failed_titles 为空，全部标题/简介都未处理，全部写入
-        if not failed_titles and user_titles:
-            # 注册阶段就失败了，全部写入
-            failed_titles = list(user_titles)
-            failed_intros = list(user_intros)
-
-        if failed_titles:
-            try:
-                failed_title_path = os.path.join(output_dir, "失败标题.txt")
-                failed_intro_path = os.path.join(output_dir, "失败简介.txt")
-                with _file_write_lock:
-                    with open(failed_title_path, "a", encoding="utf-8") as ft:
-                        for t in failed_titles:
-                            ft.write(t + "\n")
-                    with open(failed_intro_path, "a", encoding="utf-8") as fi:
-                        for intro in failed_intros:
-                            fi.write(intro + "\n")
-                if log_callback:
-                    log_callback(f"[用户{task_id}] 已写入 {len(failed_titles)} 条失败记录到 {output_dir}")
-            except Exception as write_err:
-                if log_callback:
-                    log_callback(f"[用户{task_id}] 写入失败文件出错: {write_err}")
-
         return f"用户{task_id} 失败: {str(e)}"
     finally:
-        # 清理资源，不卡死
+        unregister_driver(task_id)
         if session and token:
             try:
                 session.delete(f"https://api.modrinth.com/v2/session/{token}")
@@ -590,7 +508,6 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
                 driver.quit()
             except:
                 pass
-        # 清理该任务的用户数据目录锁文件，避免下次启动失败
         try:
             base_dir = os.path.dirname(os.path.realpath(sys.argv[0])) if getattr(sys, 'frozen',
                                                                                  False) else os.path.dirname(
@@ -601,12 +518,7 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
             pass
 
 
-# ====================================================================
-# ===================== GUI 主程序 =====================
-
-
 class ModrinthCollector:
-    """Modrinth 收藏夹分配与注册引擎"""
     MAX_PER_USER = 32
 
     def __init__(self, title_files, intro_files, output_dir, thread_count,
@@ -620,7 +532,8 @@ class ModrinthCollector:
         self.stop_event = Event()
         self.pause_event = Event()
         self.lock = threading.Lock()
-        self.total_processed = 0
+        self.completed_collections = 0
+        self._is_running = False
 
     def _log(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -629,252 +542,182 @@ class ModrinthCollector:
         if self.log_callback:
             self.log_callback(log_msg)
 
-    def _read_lines_from_files(self, file_paths):
-        """从多个txt文件中按行读取内容"""
-        lines = []
-        for fp in file_paths:
-            if not os.path.exists(fp):
-                self._log(f"⚠️ 文件不存在，跳过: {fp}")
-                continue
-            try:
-                with open(fp, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line:
-                            lines.append(line)
-                self._log(f"   从 [{os.path.basename(fp)}] 读取 {len(lines)} 行")
-            except Exception as e:
-                self._log(f"⚠️ 读取文件失败 [{fp}]: {e}")
-        return lines
-
-    def _distribute_to_users(self, titles):
-        """
-        将标题按顺序分发给用户，每个用户最多32个收藏夹，
-        且同一个用户的32个标题不能重复。
-        返回: list of dicts, 每个 dict 包含 user_index 和 titles
-        """
-        users = []
-        current_user_titles = []
-        current_user_seen = set()
-        user_idx = 0
-
-        for title in titles:
-            if self.stop_event.is_set():
-                break
-            while self.pause_event.is_set() and not self.stop_event.is_set():
-                time.sleep(0.1)
-
-            if title in current_user_seen:
-                if current_user_titles:
-                    users.append({
-                        "user_index": user_idx,
-                        "titles": current_user_titles.copy()
-                    })
-                    self._log(f"   用户 #{user_idx + 1} 分配完成，共 {len(current_user_titles)} 个标题")
-                user_idx += 1
-                current_user_titles = [title]
-                current_user_seen = {title}
-                self._log(f"   标题重复 [{title[:30]}...] -> 创建新用户 #{user_idx + 1}")
-            else:
-                if len(current_user_titles) >= self.MAX_PER_USER:
-                    users.append({
-                        "user_index": user_idx,
-                        "titles": current_user_titles.copy()
-                    })
-                    self._log(f"   用户 #{user_idx + 1} 已满32个，创建新用户 #{user_idx + 2}")
-                    user_idx += 1
-                    current_user_titles = [title]
-                    current_user_seen = {title}
-                else:
-                    current_user_titles.append(title)
-                    current_user_seen.add(title)
-
-        if current_user_titles and not self.stop_event.is_set():
-            users.append({
-                "user_index": user_idx,
-                "titles": current_user_titles.copy()
-            })
-            self._log(f"   用户 #{user_idx + 1} 分配完成，共 {len(current_user_titles)} 个标题")
-
-        return users
-
     def run(self):
-        self._log("=" * 60)
-        self._log("🚀 Modrinth 收藏夹分配分析启动")
-        self._log(f"   标题文件: {len(self.title_files)} 个")
-        self._log(f"   简介文件: {len(self.intro_files)} 个")
-        self._log(f"   输出目录: {self.output_dir}")
-        self._log(f"   浏览器最大数: {self.thread_count}")
-        self._log("=" * 60)
-
-        # 1. 读取标题和简介
-        self._log("\n📖 步骤1: 读取标题文件...")
-        raw_titles = self._read_lines_from_files(self.title_files)
-        self._log(f"   标题总行数: {len(raw_titles)}")
-
-        self._log("\n📖 步骤2: 读取简介文件...")
-        raw_intros = self._read_lines_from_files(self.intro_files)
-        self._log(f"   简介总行数: {len(raw_intros)}")
-
-        if not raw_titles or not raw_intros:
-            self._log("\n❌ 标题或简介为空，无法继续")
-            return
-
-        # 2. 对齐标题和简介数量
-        self._log("\n📊 步骤3: 对齐标题和简介数量...")
-        title_count = len(raw_titles)
-        intro_count = len(raw_intros)
-
-        if title_count > intro_count:
-            diff = title_count - intro_count
-            self._log(f"   标题({title_count}) > 简介({intro_count})，追加 {diff} 个简介")
-            extended_intros = raw_intros.copy()
-            for i in range(diff):
-                extended_intros.append(raw_intros[i % intro_count])
-            raw_intros = extended_intros
-        elif title_count < intro_count:
-            diff = intro_count - title_count
-            self._log(f"   标题({title_count}) < 简介({intro_count})，追加 {diff} 个标题")
-            extended_titles = raw_titles.copy()
-            for i in range(diff):
-                extended_titles.append(raw_titles[i % title_count])
-            raw_titles = extended_titles
-        else:
-            self._log(f"   标题({title_count}) = 简介({intro_count})，无需追加")
-
-        total_folders = len(raw_titles)
-        self._log(f"\n📊 最终对齐: 标题数={total_folders}, 简介数={len(raw_intros)}")
-        self._log(f"   需要创建的收藏夹总数: {total_folders}")
-
-        # 3. 分发标题到用户
-        self._log("\n👤 步骤4: 按用户分发标题（每个用户最多32个，标题不重复）...")
-        users = self._distribute_to_users(raw_titles)
-        total_users = len(users)
-
-        self._log(f"\n📊 分配结果汇总:")
-        self._log(f"   总收藏夹数: {total_folders}")
-        self._log(f"   总用户数: {total_users}")
-        for u in users:
-            self._log(f"   用户 #{u['user_index'] + 1}: {len(u['titles'])} 个收藏夹")
-
-        # 4. 生成分配方案文件（放在程序目录下的 plans 文件夹）
-        self._log("\n💾 步骤5: 生成分配方案文件...")
-        plan_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plans")
-        os.makedirs(plan_dir, exist_ok=True)
-
-        output_lines = []
-        output_lines.append("=" * 60)
-        output_lines.append("Modrinth 收藏夹分配方案")
-        output_lines.append("=" * 60)
-        output_lines.append(f"总收藏夹数: {total_folders}")
-        output_lines.append(f"总用户数: {total_users}")
-        output_lines.append(f"每个用户最多收藏夹: {self.MAX_PER_USER}")
-        output_lines.append("=" * 60)
-        output_lines.append("")
-
-        global_collection_idx = 0
-        for u in users:
-            output_lines.append(f"--- 用户 #{u['user_index'] + 1} ({len(u['titles'])} 个收藏夹) ---")
-            for idx, t in enumerate(u["titles"], 1):
-                intro = raw_intros[global_collection_idx] if global_collection_idx < len(raw_intros) else ""
-                output_lines.append(f"  收藏夹 {idx}: 标题={t} | 简介={intro}")
-                global_collection_idx += 1
-            output_lines.append("")
-
-        plan_path = os.path.join(plan_dir, f"collection_plan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
-        with open(plan_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(output_lines))
-        self._log(f"   分配方案: {plan_path}")
-
-        # 5. 并发执行注册任务
-        self._log("\n🚀 步骤6: 开始并发注册...")
-        self._log(f"   调试: 浏览器最大数={self.thread_count}, 用户数={total_users}")
-        self._log(f"   调试: 用户列表长度={len(users)}")
-        if not users:
-            self._log("   错误: 没有用户需要处理!")
-            return
-        self._log(f"   并发浏览器: {self.thread_count}")
-        self._log(f"   总用户数: {total_users}")
-
-        # ===== 优化：跳过同步测试，直接并发提交所有任务 =====
-        self._log("   直接并发提交所有任务...")
-
-        completed = 0
-        executor = ThreadPoolExecutor(max_workers=self.thread_count)
-        futures = {}
+        with self.lock:
+            if self._is_running:
+                self._log("已有任务在运行中，跳过")
+                return
+            self._is_running = True
+            self.stop_event.clear()
 
         try:
-            for u in users:
-                if self.stop_event.is_set():
-                    self._log("   收到停止信号，终止提交新任务")
-                    break
+            self._log("=" * 60)
+            self._log("🚀 Modrinth 无限循环创建启动")
+            self._log(f"   标题文件: {len(self.title_files)} 个")
+            self._log(f"   简介文件: {len(self.intro_files)} 个")
+            self._log(f"   输出目录: {self.output_dir}")
+            self._log(f"   浏览器最大数: {self.thread_count}")
+            self._log("=" * 60)
 
-                user_idx = u["user_index"] + 1
-                user_titles = u["titles"]
-                user_intros = []
-                # 计算该用户在全局收藏夹中的起始位置
-                start_idx = sum(len(users[i]["titles"]) for i in range(u["user_index"]))
-                for idx in range(len(user_titles)):
-                    intro_idx = start_idx + idx
-                    user_intros.append(raw_intros[intro_idx] if intro_idx < len(raw_intros) else "")
-
-                self._log(f"   [提交] 用户 #{user_idx} - {len(user_titles)} 个收藏夹")
-                future = executor.submit(
-                    single_user_task,
-                    task_id=user_idx,
-                    user_titles=user_titles,
-                    user_intros=user_intros,
-                    output_dir=self.output_dir,
-                    log_callback=self.log_callback
-                )
-                futures[future] = user_idx
-                time.sleep(2)  # 错开启动时间，避免端口冲突
-
-            self._log(f"   已提交 {len(futures)} 个任务，等待执行...")
-
-            for future in as_completed(futures):
-                if self.stop_event.is_set():
-                    self._log("   收到停止信号，终止等待")
-                    break
-                while self.pause_event.is_set() and not self.stop_event.is_set():
-                    time.sleep(0.1)
-
-                user_idx = futures[future]
+            self._log("\n📖 读取标题池...")
+            title_pool = []
+            for fp in self.title_files:
+                if not os.path.exists(fp):
+                    self._log(f"⚠️ 标题文件不存在，跳过: {fp}")
+                    continue
                 try:
-                    result = future.result(timeout=600)  # 10分钟超时
-                    self._log(f"   [完成] 用户 #{user_idx}: {result}")
+                    with open(fp, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                title_pool.append(line)
+                    self._log(f"   从 [{os.path.basename(fp)}] 读取")
                 except Exception as e:
-                    self._log(f"   [错误] 用户 #{user_idx}: {str(e)}")
+                    self._log(f"⚠️ 读取标题文件失败 [{fp}]: {e}")
+            title_pool = list(dict.fromkeys(title_pool))
+            self._log(f"   标题池去重后: {len(title_pool)} 个")
 
-                completed += 1
+            if not title_pool:
+                self._log("\n❌ 标题池为空，无法继续")
+                return
+
+            self._log("\n📖 读取简介池...")
+            intro_files_data = []
+            for fp in self.intro_files:
+                lines = []
+                if not os.path.exists(fp):
+                    self._log(f"⚠️ 简介文件不存在，跳过: {fp}")
+                    continue
+                try:
+                    with open(fp, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                lines.append(line)
+                    self._log(f"   从 [{os.path.basename(fp)}] 读取 {len(lines)} 行")
+                except Exception as e:
+                    self._log(f"⚠️ 读取简介文件失败 [{fp}]: {e}")
+                if lines:
+                    intro_files_data.append(lines)
+
+            if not intro_files_data:
+                self._log("\n❌ 没有有效的简介文件，无法继续")
+                return
+
+            self._log(f"   简介文件数: {len(intro_files_data)}")
+
+            self._log("\n💾 生成分配方案文件...")
+            plan_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plans")
+            os.makedirs(plan_dir, exist_ok=True)
+
+            output_lines = []
+            output_lines.append("=" * 60)
+            output_lines.append("Modrinth 收藏夹分配方案")
+            output_lines.append("=" * 60)
+            output_lines.append(f"标题池数量: {len(title_pool)}")
+            output_lines.append(f"简介文件数: {len(intro_files_data)}")
+            output_lines.append(f"每个用户最多收藏夹: {self.MAX_PER_USER}")
+            output_lines.append("=" * 60)
+            output_lines.append("")
+
+            plan_path = os.path.join(plan_dir, f"collection_plan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+            with open(plan_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(output_lines))
+            self._log(f"   分配方案: {plan_path}")
+
+            self._log("\n🚀 开始无限循环创建...")
+            self._log(f"   并发浏览器: {self.thread_count}")
+
+            def on_collection_created(title):
+                with self.lock:
+                    self.completed_collections += 1
                 if self.progress_callback:
                     self.progress_callback({
-                        "current": completed,
-                        "total": total_users,
-                        "status": f"已完成 {completed}/{total_users} 个用户"
+                        "current": self.completed_collections,
+                        "status": f"已完成 {self.completed_collections} 个收藏夹"
                     })
 
-        finally:
-            self._log("   正在关闭线程池...")
-            executor.shutdown(wait=False)
-            self._log("   线程池已关闭")
+            if self.progress_callback:
+                self.progress_callback({
+                    "current": self.completed_collections,
+                    "status": f"已完成 {self.completed_collections} 个收藏夹"
+                })
 
-        self._log("\n" + "=" * 60)
-        self._log("✅ 全部完成!")
-        self._log(f"   总收藏夹数: {total_folders}")
-        self._log(f"   总用户数: {total_users}")
-        self._log(f"   完成用户: {completed}/{total_users}")
-        self._log(f"   分配方案: {plan_path}")
-        self._log("=" * 60)
+            with ThreadPoolExecutor(max_workers=self.thread_count) as executor:
+                futures = {}
+                next_user_idx = 0
+
+                while not self.stop_event.is_set():
+                    done_futures = [f for f in list(futures.keys()) if f.done()]
+                    for f in done_futures:
+                        user_idx = futures.pop(f)
+                        try:
+                            result = f.result()
+                            self._log(f"   [完成] 用户 #{user_idx}: {result}")
+                        except Exception as e:
+                            self._log(f"   [错误] 用户 #{user_idx}: {str(e)}")
+
+                    if self.pause_event.is_set():
+                        time.sleep(0.5)
+                        continue
+
+                    if len(futures) >= self.thread_count:
+                        time.sleep(0.5)
+                        continue
+
+                    next_user_idx += 1
+                    count = min(self.MAX_PER_USER, len(title_pool))
+                    titles = random.sample(title_pool, count)
+
+                    intros = []
+                    for i in range(count):
+                        parts = [random.choice(lines) for lines in intro_files_data]
+                        intros.append("".join(parts))
+
+                    self._log(f"   [提交] 用户 #{next_user_idx} - {len(titles)} 个收藏夹")
+                    future = executor.submit(
+                        single_user_task,
+                        task_id=next_user_idx,
+                        user_titles=titles,
+                        user_intros=intros,
+                        output_dir=self.output_dir,
+                        log_callback=self.log_callback,
+                        on_collection_created=on_collection_created
+                    )
+                    futures[future] = next_user_idx
+                    time.sleep(2)
+
+                self._log("   收到停止信号，终止提交新任务")
+                for f in list(futures.keys()):
+                    f.cancel()
+                close_all_drivers()
+                self._log("   已关闭所有浏览器")
+
+            self._log("\n" + "=" * 60)
+            self._log("✅ 任务结束")
+            self._log(f"   已完成收藏夹: {self.completed_collections} 个")
+            self._log("=" * 60)
+
+        finally:
+            with self.lock:
+                self._is_running = False
 
     def stop(self):
         self.stop_event.set()
+        self.pause_event.set()
+        close_all_drivers()
+        self._log("🛑 已停止")
 
     def pause(self):
+        self.stop_event.set()
         self.pause_event.set()
+        close_all_drivers()
+        self._log("⏸ 已暂停，关闭所有浏览器...")
 
     def resume(self):
+        self.stop_event.clear()
         self.pause_event.clear()
+        self._log("▶ 继续运行")
 
 
 def run_gui():
@@ -900,7 +743,13 @@ def run_gui():
     def update_progress(data):
         log_queue.put(("progress", data))
 
-    # 标题栏
+    def on_closing():
+        if engine[0]:
+            engine[0].stop()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+
     title_frame = tk.Frame(root, bg="#2c5aa0")
     title_frame.pack(fill=tk.X)
     tk.Label(title_frame, text="📝 Modrinth 批量注册工具", font=("微软雅黑", 16, "bold"),
@@ -909,11 +758,9 @@ def run_gui():
     main = tk.Frame(root, padx=15, pady=10)
     main.pack(fill=tk.BOTH, expand=True)
 
-    # 配置区
     cfg = tk.LabelFrame(main, text="配置选项", font=("微软雅黑", 10, "bold"))
     cfg.pack(fill=tk.X, pady=5)
 
-    # 线程数配置
     thread_frame = tk.Frame(cfg)
     thread_frame.pack(fill=tk.X, pady=5, padx=10)
     tk.Label(thread_frame, text="浏览器数:", font=("微软雅黑", 10, "bold"), width=10, anchor=tk.W).pack(side=tk.LEFT)
@@ -924,7 +771,6 @@ def run_gui():
     thread_spin.delete(0, tk.END)
     thread_spin.insert(0, "3")
 
-    # 标题目录
     title_dir_frame = tk.Frame(cfg)
     title_dir_frame.pack(fill=tk.X, pady=5, padx=10)
     tk.Label(title_dir_frame, text="标题目录:", font=("微软雅黑", 10, "bold"), width=10, anchor=tk.W).pack(side=tk.LEFT)
@@ -940,7 +786,6 @@ def run_gui():
     tk.Button(title_dir_frame, text="浏览...", command=choose_title_dir,
               font=("微软雅黑", 9), width=8).pack(side=tk.LEFT)
 
-    # 简介目录
     intro_dir_frame = tk.Frame(cfg)
     intro_dir_frame.pack(fill=tk.X, pady=5, padx=10)
     tk.Label(intro_dir_frame, text="简介目录:", font=("微软雅黑", 10, "bold"), width=10, anchor=tk.W).pack(side=tk.LEFT)
@@ -956,7 +801,6 @@ def run_gui():
     tk.Button(intro_dir_frame, text="浏览...", command=choose_intro_dir,
               font=("微软雅黑", 9), width=8).pack(side=tk.LEFT)
 
-    # 输出目录
     output_dir_frame = tk.Frame(cfg)
     output_dir_frame.pack(fill=tk.X, pady=5, padx=10)
     tk.Label(output_dir_frame, text="输出目录:", font=("微软雅黑", 10, "bold"), width=10, anchor=tk.W).pack(
@@ -972,11 +816,9 @@ def run_gui():
     tk.Button(output_dir_frame, text="浏览...", command=choose_output_dir,
               font=("微软雅黑", 9), width=8).pack(side=tk.LEFT)
 
-    # 文件选择区
     files_frame = tk.Frame(main)
     files_frame.pack(fill=tk.X, pady=5)
 
-    # 标题文件列表
     title_list_frame = tk.LabelFrame(files_frame, text="标题文件列表（勾选添加）", font=("微软雅黑", 10, "bold"),
                                      height=200)
     title_list_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
@@ -995,7 +837,6 @@ def run_gui():
     title_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     title_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-    # 简介文件列表
     intro_list_frame = tk.LabelFrame(files_frame, text="简介文件列表（勾选添加）", font=("微软雅黑", 10, "bold"),
                                      height=200)
     intro_list_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
@@ -1114,7 +955,6 @@ def run_gui():
         intro_input.delete("1.0", tk.END)
         intro_input.insert(tk.END, "\n".join(intro_list))
 
-    # 输入框区域
     input_frame = tk.Frame(main)
     input_frame.pack(fill=tk.X, pady=5)
 
@@ -1138,7 +978,6 @@ def run_gui():
     intro_input_scroll.pack(side=tk.RIGHT, fill=tk.Y)
     intro_input.config(yscrollcommand=intro_input_scroll.set)
 
-    # 控制按钮
     btn_frame = tk.Frame(main)
     btn_frame.pack(fill=tk.X, pady=10)
 
@@ -1150,7 +989,6 @@ def run_gui():
                           font=("微软雅黑", 12, "bold"), width=12, height=1, state=tk.DISABLED)
     pause_btn.pack(side=tk.LEFT, padx=5)
 
-    # 进度区
     prog_frame = tk.LabelFrame(main, text="处理进度", font=("微软雅黑", 10, "bold"))
     prog_frame.pack(fill=tk.X, pady=5)
 
@@ -1160,18 +998,17 @@ def run_gui():
 
     progress_frame = tk.Frame(prog_frame)
     progress_frame.pack(fill=tk.X, padx=10, pady=2)
-    tk.Label(progress_frame, text="用户进度:", font=("微软雅黑", 9), width=12, anchor=tk.W).pack(side=tk.LEFT)
+    tk.Label(progress_frame, text="收藏夹进度:", font=("微软雅黑", 9), width=12, anchor=tk.W).pack(side=tk.LEFT)
     progress_var = tk.DoubleVar(value=0)
     progress_bar = ttk.Progressbar(progress_frame, variable=progress_var, maximum=100, length=750)
     progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
-    progress_label = tk.Label(progress_frame, text="0/0", font=("微软雅黑", 9), width=8)
+    progress_label = tk.Label(progress_frame, text="0", font=("微软雅黑", 9), width=8)
     progress_label.pack(side=tk.LEFT, padx=5)
 
-    stats_label = tk.Label(prog_frame, text="已处理: 0 个用户 | 状态: 就绪",
+    stats_label = tk.Label(prog_frame, text="已完成: 0 个收藏夹 | 状态: 就绪",
                            font=("微软雅黑", 9), fg="#666", anchor=tk.W)
     stats_label.pack(fill=tk.X, padx=10, pady=5)
 
-    # 日志区
     log_frame = tk.LabelFrame(main, text="运行日志", font=("微软雅黑", 10, "bold"))
     log_frame.pack(fill=tk.BOTH, expand=True, pady=5)
 
@@ -1195,11 +1032,10 @@ def run_gui():
                 item = log_queue.get_nowait()
                 if isinstance(item, tuple) and item[0] == "progress":
                     d = item[1]
-                    pct = (d["current"] / d["total"]) * 100 if d["total"] > 0 else 0
-                    progress_var.set(pct)
-                    progress_label.config(text=f"{d['current']}/{d['total']}")
+                    progress_var.set(d["current"] % 100)
+                    progress_label.config(text=f"{d['current']}")
                     task_label.config(text=f"状态: {d['status']}")
-                    stats_label.config(text=f"已处理: {d['current']} 个用户 | 状态: {d['status']}")
+                    stats_label.config(text=f"已完成: {d['current']} 个收藏夹 | 状态: {d['status']}")
                 else:
                     add_log(item)
         except queue.Empty:
@@ -1226,7 +1062,6 @@ def run_gui():
         out_dir = output_dir_var.get()
         os.makedirs(out_dir, exist_ok=True)
 
-        # tc = DEFAULT_THREAD_COUNT
         try:
             tc = int(thread_spin.get())
             if not 1 <= tc <= 6:
@@ -1236,8 +1071,8 @@ def run_gui():
             return
 
         engine[0] = ModrinthCollector(
-            title_files=title_list.copy(),
-            intro_files=intro_list.copy(),
+            title_files=title_list,
+            intro_files=intro_list,
             output_dir=out_dir,
             thread_count=tc,
             log_callback=log,
@@ -1254,11 +1089,39 @@ def run_gui():
         if pause_btn.cget("text") == "⏸ 暂停":
             engine[0].pause()
             pause_btn.config(text="▶ 继续")
-            status_bar.config(text="已暂停（新任务暂停提交，运行中任务继续）")
+            status_bar.config(text="已暂停")
         else:
-            engine[0].resume()
-            pause_btn.config(text="⏸ 暂停")
-            status_bar.config(text="处理中...")
+            old_count = engine[0].completed_collections if engine[0] else 0
+
+            def do_resume():
+                if engine[0] and getattr(engine[0], '_is_running', False):
+                    root.after(100, do_resume)
+                    return
+
+                out_dir = output_dir_var.get()
+                try:
+                    tc = int(thread_spin.get())
+                    if not 1 <= tc <= 6:
+                        raise ValueError
+                except ValueError:
+                    tc = 3
+
+                engine[0] = ModrinthCollector(
+                    title_files=title_list,
+                    intro_files=intro_list,
+                    output_dir=out_dir,
+                    thread_count=tc,
+                    log_callback=log,
+                    progress_callback=update_progress
+                )
+                engine[0].completed_collections = old_count
+                engine[0].resume()
+                pause_btn.config(text="⏸ 暂停")
+                status_bar.config(text="处理中...")
+                Thread(target=lambda: engine[0].run(), daemon=True).start()
+
+            status_bar.config(text="等待当前任务结束...")
+            do_resume()
 
     start_btn.config(command=start_processing)
     pause_btn.config(command=pause_processing)
