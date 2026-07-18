@@ -1224,7 +1224,7 @@ def run_gui():
         if pause_btn.cget("text") == "⏸ 暂停":
             engine[0].pause()
             pause_btn.config(text="▶ 继续")
-            status_bar.config(text="已暂停")
+            status_bar.config(text="已暂停（新任务暂停提交，运行中任务继续）")
         else:
             engine[0].resume()
             pause_btn.config(text="⏸ 暂停")
