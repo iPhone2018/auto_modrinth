@@ -2,16 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Modrinth 批量注册 + 收藏夹管理工具 - GUI版
-
-功能：
-- 选择标题目录（必选，展示目录内所有txt文件，支持勾选）
-- 选择简介目录（必选，展示目录内所有txt文件，支持勾选）
-- 选择结果文件存放目录（必选）
-- 线程数配置（同时启动浏览器数量）
-- 自动分析：标题/简介数量 -> 计算需要多少用户（随机邮箱）
-- 每个用户创建32个收藏夹，标题不重复，每个收藏夹1标题+1简介
-- 启动/暂停/继续按钮
-- 实时日志显示（带滚动）
+已优化多开浏览器页面卡死问题：文件锁、轻量化Chrome、进程清理、快速页面加载
 """
 
 import os
@@ -62,6 +53,8 @@ warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 # ====================== 全局配置 ======================
 DEFAULT_THREAD_COUNT = 2
 MAX_COLLECTIONS_PER_USER = 32  # 每个用户最多32个收藏夹
+# 新增：多线程文件写入锁，解决并发读写磁盘阻塞
+FILE_WRITE_LOCK = threading.Lock()
 
 
 def init_browser(task_id: int):
@@ -109,11 +102,26 @@ def init_browser(task_id: int):
 
     # ===== 窗口配置：全屏最大化 =====
     options.add_argument("--start-maximized")
-    # =====================================================
+
+    # ========== 新增多开轻量化、防页面卡死核心优化参数 ==========
+    options.page_load_strategy = "eager"  # 只等待DOM就绪，不等图片/静态资源，大幅减少加载阻塞
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--memory-pressure-off")
+    options.add_argument("--js-flags=--expose-gc")
+    options.add_argument("--disable-plugins")
+    options.add_argument("--single-process")  # 精简chrome子进程，降低内存CPU占用
+    options.add_argument("--aggressive-cache-discard")
+    options.add_argument("--disable-background-timer-throttling")
 
     user_data_dir = os.path.join(base_dir, f"chrome_user_data_task_{task_id}")
     os.makedirs(user_data_dir, exist_ok=True)
+    # 独立缓存目录，隔离多实例磁盘IO争抢
+    temp_dir = os.path.join(base_dir, f"chrome_temp_task_{task_id}")
+    os.makedirs(temp_dir, exist_ok=True)
     options.add_argument(f"--user-data-dir={user_data_dir}")
+    options.add_argument(f"--disk-cache-dir={temp_dir}")
+
     debug_port = 9222 + task_id * 10
     options.add_argument(f"--remote-debugging-port={debug_port}")
 
@@ -183,9 +191,10 @@ def auto_fit_columns(ws, min_w=8, max_w=50, padding=3):
 
 
 def append_link_to_txt(link: str, file_path: str = "links.txt"):
-    """将单个链接追加写入txt文件"""
-    with open(file_path, "a", encoding="utf-8") as f:
-        f.write(link + "\n")
+    """将单个链接追加写入txt文件（加线程锁）"""
+    with FILE_WRITE_LOCK:
+        with open(file_path, "a", encoding="utf-8") as f:
+            f.write(link + "\n")
 
 
 # ===================== 单用户注册 + 创建收藏夹任务 =====================
@@ -215,7 +224,8 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
         driver, wait, short_wait = init_browser(task_id)
         if log_callback:
             log_callback(f"[用户{task_id}] 浏览器初始化成功")
-        long_wait = WebDriverWait(driver, 6000)
+        # 优化：超长等待6000s改为120秒，卡死自动释放
+        long_wait = WebDriverWait(driver, 120)
 
         # 1. 打开网站并注册
         driver.get("https://modrinth.com")
@@ -521,12 +531,14 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
             try:
                 failed_title_path = os.path.join(output_dir, "失败标题.txt")
                 failed_intro_path = os.path.join(output_dir, "失败简介.txt")
-                with open(failed_title_path, "a", encoding="utf-8") as ft:
-                    for t in failed_titles:
-                        ft.write(t + "\n")
-                with open(failed_intro_path, "a", encoding="utf-8") as fi:
-                    for intro in failed_intros:
-                        fi.write(intro + "\n")
+                # 写入失败文件加全局锁
+                with FILE_WRITE_LOCK:
+                    with open(failed_title_path, "a", encoding="utf-8") as ft:
+                        for t in failed_titles:
+                            ft.write(t + "\n")
+                    with open(failed_intro_path, "a", encoding="utf-8") as fi:
+                        for intro in failed_intros:
+                            fi.write(intro + "\n")
                 if log_callback:
                     log_callback(f"[用户{task_id}] 已写入 {len(failed_titles)} 条失败记录到 {output_dir}")
             except Exception as write_err:
@@ -549,7 +561,15 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
         if driver:
             try:
                 driver.quit()
-            except:
+            except Exception:
+                pass
+            # 新增：强制杀死残留chrome、chromedriver僵尸进程，释放端口
+            import subprocess
+            try:
+                if sys.platform == "win32":
+                    subprocess.call(f'taskkill /f /im chrome.exe /fi "windowtitle:*task_{task_id}*"', shell=True)
+                    subprocess.call("taskkill /f /im chromedriver.exe", shell=True)
+            except Exception:
                 pass
 
 
@@ -780,7 +800,8 @@ class ModrinthCollector:
                     log_callback=self.log_callback
                 )
                 futures[future] = user_idx
-                time.sleep(10)  # 错开启动时间，避免端口冲突
+                # 优化：固定10s改为6~10随机间隔，错开浏览器初始化
+                time.sleep(random.uniform(6, 10))
 
             self._log(f"   已提交 {len(futures)} 个任务，等待执行...")
 
@@ -793,7 +814,7 @@ class ModrinthCollector:
 
                 user_idx = futures[future]
                 try:
-                    result = future.result(timeout=600)  # 10分钟超时
+                    result = future.result(timeout=600)  # 10分钟任务整体超时
                     self._log(f"   [完成] 用户 #{user_idx}: {result}")
                 except Exception as e:
                     self._log(f"   [错误] 用户 #{user_idx}: {str(e)}")
@@ -1081,135 +1102,4 @@ def run_gui():
     intro_input.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
     intro_input_scroll = tk.Scrollbar(intro_input_frame, command=intro_input.yview)
     intro_input_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-    intro_input.config(yscrollcommand=intro_input_scroll.set)
-
-    # 控制按钮
-    btn_frame = tk.Frame(main)
-    btn_frame.pack(fill=tk.X, pady=10)
-
-    start_btn = tk.Button(btn_frame, text="▶ 启动", bg="#4CAF50", fg="white",
-                          font=("微软雅黑", 12, "bold"), width=15, height=1)
-    start_btn.pack(side=tk.LEFT, padx=5)
-
-    pause_btn = tk.Button(btn_frame, text="⏸ 暂停", bg="#FF9800", fg="white",
-                          font=("微软雅黑", 12, "bold"), width=12, height=1, state=tk.DISABLED)
-    pause_btn.pack(side=tk.LEFT, padx=5)
-
-    # 进度区
-    prog_frame = tk.LabelFrame(main, text="处理进度", font=("微软雅黑", 10, "bold"))
-    prog_frame.pack(fill=tk.X, pady=5)
-
-    task_label = tk.Label(prog_frame, text="就绪", font=("微软雅黑", 11, "bold"),
-                          fg="#333", anchor=tk.W)
-    task_label.pack(fill=tk.X, padx=10, pady=5)
-
-    progress_frame = tk.Frame(prog_frame)
-    progress_frame.pack(fill=tk.X, padx=10, pady=2)
-    tk.Label(progress_frame, text="用户进度:", font=("微软雅黑", 9), width=12, anchor=tk.W).pack(side=tk.LEFT)
-    progress_var = tk.DoubleVar(value=0)
-    progress_bar = ttk.Progressbar(progress_frame, variable=progress_var, maximum=100, length=750)
-    progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
-    progress_label = tk.Label(progress_frame, text="0/0", font=("微软雅黑", 9), width=8)
-    progress_label.pack(side=tk.LEFT, padx=5)
-
-    stats_label = tk.Label(prog_frame, text="已处理: 0 个用户 | 状态: 就绪",
-                           font=("微软雅黑", 9), fg="#666", anchor=tk.W)
-    stats_label.pack(fill=tk.X, padx=10, pady=5)
-
-    # 日志区
-    log_frame = tk.LabelFrame(main, text="运行日志", font=("微软雅黑", 10, "bold"))
-    log_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-
-    log_text = scrolledtext.ScrolledText(log_frame, font=("Consolas", 9), wrap=tk.WORD,
-                                         state=tk.DISABLED, bg="#1e1e1e", fg="#d4d4d4",
-                                         insertbackground="white")
-    log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-    status_bar = tk.Label(root, text="就绪", bd=1, relief=tk.SUNKEN, anchor=tk.W, font=("微软雅黑", 9))
-    status_bar.pack(side=tk.BOTTOM, fill=tk.X)
-
-    def add_log(msg):
-        log_text.config(state=tk.NORMAL)
-        log_text.insert(tk.END, msg + "\n")
-        log_text.see(tk.END)
-        log_text.config(state=tk.DISABLED)
-
-    def refresh():
-        try:
-            while True:
-                item = log_queue.get_nowait()
-                if isinstance(item, tuple) and item[0] == "progress":
-                    d = item[1]
-                    pct = (d["current"] / d["total"]) * 100 if d["total"] > 0 else 0
-                    progress_var.set(pct)
-                    progress_label.config(text=f"{d['current']}/{d['total']}")
-                    task_label.config(text=f"状态: {d['status']}")
-                    stats_label.config(text=f"已处理: {d['current']} 个用户 | 状态: {d['status']}")
-                else:
-                    add_log(item)
-        except queue.Empty:
-            pass
-        root.after(200, refresh)
-
-    def start_processing():
-        if not title_dir_var.get():
-            messagebox.showerror("错误", "请选择标题目录")
-            return
-        if not intro_dir_var.get():
-            messagebox.showerror("错误", "请选择简介目录")
-            return
-        if not output_dir_var.get():
-            messagebox.showerror("错误", "请选择结果文件存放目录")
-            return
-        if not title_list:
-            messagebox.showerror("错误", "请至少勾选一个标题文件")
-            return
-        if not intro_list:
-            messagebox.showerror("错误", "请至少勾选一个简介文件")
-            return
-
-        out_dir = output_dir_var.get()
-        os.makedirs(out_dir, exist_ok=True)
-
-        try:
-            tc = int(thread_count_var.get())
-        except ValueError:
-            tc = DEFAULT_THREAD_COUNT
-
-        engine[0] = ModrinthCollector(
-            title_files=title_list.copy(),
-            intro_files=intro_list.copy(),
-            output_dir=out_dir,
-            thread_count=tc,
-            log_callback=log,
-            progress_callback=update_progress
-        )
-        start_btn.config(state=tk.DISABLED)
-        pause_btn.config(state=tk.NORMAL)
-        status_bar.config(text="处理中...")
-        Thread(target=lambda: engine[0].run(), daemon=True).start()
-
-    def pause_processing():
-        if not engine[0]:
-            return
-        if pause_btn.cget("text") == "⏸ 暂停":
-            engine[0].pause()
-            pause_btn.config(text="▶ 继续")
-            status_bar.config(text="已暂停")
-        else:
-            engine[0].resume()
-            pause_btn.config(text="⏸ 暂停")
-            status_bar.config(text="处理中...")
-
-    start_btn.config(command=start_processing)
-    pause_btn.config(command=pause_processing)
-
-    add_log("Modrinth 批量注册工具已启动")
-    add_log("请依次选择：标题目录 -> 简介目录 -> 输出目录")
-    add_log("勾选需要的文件后，点击「启动」开始")
-    refresh()
-    root.mainloop()
-
-
-if __name__ == "__main__":
-    run_gui()
+    intro_input
