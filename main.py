@@ -191,7 +191,7 @@ def retry_click(driver, element, max_retries=3, delay=0.5):
 
 def random_qq_email():
     chars = string.ascii_letters + string.digits
-    prefix = ''.join(random.choice(chars) for _ in range(8))
+    prefix = ''.join(random.choice(chars) for _ in range(10))
     return f"{prefix}@qq.com"
 
 
@@ -402,15 +402,20 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
             log_callback(f"[用户{task_id}] 注册完成!")
         time.sleep(5)
 
-        cookies = driver.get_cookies()
-        for ck in cookies:
-            if ck["name"] == "auth-token":
-                token = ck["value"]
+        for attempt in range(5):
+            cookies = driver.get_cookies()
+            for ck in cookies:
+                if ck["name"] == "auth-token":
+                    token = ck["value"]
+                    break
+            if token:
+                if log_callback:
+                    log_callback(f"[用户{task_id}] 获取 Token 成功")
                 break
-        if not token:
+            if attempt < 4:  # 前4次失败才等待
+                time.sleep(5)
+        else:
             raise Exception("无法获取 auth-token")
-        if log_callback:
-            log_callback(f"[用户{task_id}] 获取 Token 成功")
 
         retry_strategy = Retry(
             total=5, backoff_factor=1,
