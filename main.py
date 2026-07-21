@@ -190,9 +190,9 @@ def retry_click(driver, element, max_retries=3, delay=0.5):
 
 
 def random_qq_email():
-    chars = string.ascii_letters + string.digits
-    prefix = ''.join(random.choice(chars) for _ in range(10))
-    return f"{prefix}@qq.com"
+   # 10位时间戳（秒级）
+   prefix = str(int(time.time()))
+   return f"{prefix}@qq.com"
 
 
 def display_width(text):
