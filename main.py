@@ -213,8 +213,8 @@ def append_link_to_txt(link: str, file_path: str = "links.txt"):
             f.write(link + "\n")
 
 
-def single_user_task(task_id: int, user_titles: list, user_intros: list,
-                     output_dir: str, log_callback=None, on_collection_created=None):
+def single_user_task(task_id: int, email: str, user_titles: list, user_intros: list,
+                     output_dir: str, interval: float = 0, log_callback=None, on_collection_created=None):
     driver = None
     session = None
     token = None
@@ -242,11 +242,11 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
             log_callback(f"[用户{task_id}] 点击注册按钮")
 
         email_input = long_wait.until(EC.visibility_of_element_located((By.ID, "email")))
-        random_email = random_qq_email()
+        # random_email = random_qq_email()
         email_input.clear()
-        email_input.send_keys(random_email)
+        email_input.send_keys(email)
         if log_callback:
-            log_callback(f"[用户{task_id}] 输入随机邮箱: {random_email}")
+            log_callback(f"[用户{task_id}] 输入邮箱: {email}")
 
         pwd_input = long_wait.until(EC.visibility_of_element_located((By.ID, "password")))
         pwd_input.clear()
@@ -453,6 +453,7 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
                     on_collection_created(title)
                 if log_callback:
                     log_callback(f"[用户{task_id}] 收藏夹创建成功! ID: {collection_id}")
+                time.sleep(interval)
             else:
                 if log_callback:
                     log_callback(f"[用户{task_id}] 创建收藏夹失败: {resp.status_code} - {resp.text}")
@@ -526,7 +527,7 @@ def single_user_task(task_id: int, user_titles: list, user_intros: list,
 class ModrinthCollector:
     MAX_PER_USER = 32
 
-    def __init__(self, title_files, intro_files, output_dir, thread_count,
+    def __init__(self, title_files, intro_files, email_list, output_dir, thread_count, interval=0,
                  log_callback=None, progress_callback=None):
         self.title_files = title_files
         self.intro_files = intro_files
@@ -539,6 +540,9 @@ class ModrinthCollector:
         self.lock = threading.Lock()
         self.completed_collections = 0
         self._is_running = False
+        self.email_list = email_list
+        self.interval = interval
+        self.email_index = 0
 
     def _log(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -611,6 +615,9 @@ class ModrinthCollector:
 
             self._log(f"   简介文件数: {len(intro_files_data)}")
 
+            if not self.email_list:
+                self._log("\n❌ 邮箱列表为空，无法继续")
+                return
             self._log("\n💾 生成分配方案文件...")
             plan_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plans")
             os.makedirs(plan_dir, exist_ok=True)
@@ -679,10 +686,15 @@ class ModrinthCollector:
                         parts = [random.choice(lines) for lines in intro_files_data]
                         intros.append("".join(parts))
 
+                    email = self.email_list[self.email_index % len(self.email_list)]
+                    self.email_index += 1
+
                     self._log(f"   [提交] 用户 #{next_user_idx} - {len(titles)} 个收藏夹")
                     future = executor.submit(
                         single_user_task,
                         task_id=next_user_idx,
+                        email=email,
+                        interval=self.interval,
                         user_titles=titles,
                         user_intros=intros,
                         output_dir=self.output_dir,
@@ -725,6 +737,33 @@ class ModrinthCollector:
         self._log("▶ 继续运行")
 
 
+def load_emails_from_dir(email_dir: str):
+    """遍历目录下所有txt，按行读取邮箱，去重后返回列表"""
+    emails = []
+    if not os.path.isdir(email_dir):
+        return emails
+    for fname in sorted(os.listdir(email_dir)):
+        if not fname.lower().endswith(".txt"):
+            continue
+        fpath = os.path.join(email_dir, fname)
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and "@" in line:
+                        emails.append(line)
+        except Exception:
+            continue
+    # 去重并保持顺序
+    seen = set()
+    result = []
+    for e in emails:
+        if e not in seen:
+            seen.add(e)
+            result.append(e)
+    return result
+
+
 def run_gui():
     root = tk.Tk()
     root.title("Modrinth 批量注册工具")
@@ -737,8 +776,11 @@ def run_gui():
     title_dir_var = tk.StringVar(value="")
     intro_dir_var = tk.StringVar(value="")
     output_dir_var = tk.StringVar(value="")
+    email_dir_var = tk.StringVar(value="")
+    interval_var = tk.StringVar(value="5")
     title_list = []
     intro_list = []
+    email_list = []
     title_check_vars = {}
     intro_check_vars = {}
 
@@ -775,6 +817,15 @@ def run_gui():
         side=tk.LEFT)
     thread_spin.delete(0, tk.END)
     thread_spin.insert(0, "3")
+
+    # ===== 发布间隔 =====
+    interval_frame = tk.Frame(cfg)
+    interval_frame.pack(fill=tk.X, pady=5, padx=10)
+    tk.Label(interval_frame, text="发布间隔:", font=("微软雅黑", 10, "bold"), width=10, anchor=tk.W).pack(side=tk.LEFT)
+    interval_entry = tk.Entry(interval_frame, textvariable=interval_var, width=8, font=("微软雅黑", 10))
+    interval_entry.pack(side=tk.LEFT, padx=5)
+    tk.Label(interval_frame, text="(秒，每创建一个收藏夹后的等待时间)", font=("微软雅黑", 9), fg="#666").pack(
+        side=tk.LEFT)
 
     title_dir_frame = tk.Frame(cfg)
     title_dir_frame.pack(fill=tk.X, pady=5, padx=10)
@@ -819,6 +870,21 @@ def run_gui():
             output_dir_var.set(d)
 
     tk.Button(output_dir_frame, text="浏览...", command=choose_output_dir,
+              font=("微软雅黑", 9), width=8).pack(side=tk.LEFT)
+
+    # ===== 邮箱目录 =====
+    email_dir_frame = tk.Frame(cfg)
+    email_dir_frame.pack(fill=tk.X, pady=5, padx=10)
+    tk.Label(email_dir_frame, text="邮箱目录:", font=("微软雅黑", 10, "bold"), width=10, anchor=tk.W).pack(side=tk.LEFT)
+    tk.Entry(email_dir_frame, textvariable=email_dir_var, width=50, font=("微软雅黑", 9), state="readonly").pack(
+        side=tk.LEFT, padx=5)
+
+    def choose_email_dir():
+        d = filedialog.askdirectory(title="选择邮箱文件所在目录")
+        if d:
+            email_dir_var.set(d)
+
+    tk.Button(email_dir_frame, text="浏览...", command=choose_email_dir,
               font=("微软雅黑", 9), width=8).pack(side=tk.LEFT)
 
     files_frame = tk.Frame(main)
@@ -1057,6 +1123,9 @@ def run_gui():
         if not output_dir_var.get():
             messagebox.showerror("错误", "请选择结果文件存放目录")
             return
+        if not email_dir_var.get():
+            messagebox.showerror("错误", "请选择邮箱目录")
+            return
         if not title_list:
             messagebox.showerror("错误", "请至少勾选一个标题文件")
             return
@@ -1075,13 +1144,28 @@ def run_gui():
             messagebox.showerror("错误", "浏览器数量必须是 1~6 的整数")
             return
 
+        try:
+            interval = float(interval_var.get())
+            if interval < 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("错误", "发布间隔必须是大于等于0的数字")
+            return
+
+        email_list = load_emails_from_dir(email_dir_var.get())
+        if not email_list:
+            messagebox.showerror("错误", "邮箱目录下未找到有效的邮箱账号")
+            return
+
         engine[0] = ModrinthCollector(
             title_files=title_list,
             intro_files=intro_list,
             output_dir=out_dir,
             thread_count=tc,
             log_callback=log,
-            progress_callback=update_progress
+            progress_callback=update_progress,
+            email_list=email_list,
+            interval=interval,
         )
         start_btn.config(state=tk.DISABLED)
         pause_btn.config(state=tk.NORMAL)
@@ -1111,13 +1195,23 @@ def run_gui():
                 except ValueError:
                     tc = 3
 
+                resume_email_list = load_emails_from_dir(email_dir_var.get())
+                try:
+                    resume_interval = float(interval_var.get())
+                    if resume_interval < 0:
+                        raise ValueError
+                except ValueError:
+                    resume_interval = 0
+
                 engine[0] = ModrinthCollector(
                     title_files=title_list,
                     intro_files=intro_list,
                     output_dir=out_dir,
                     thread_count=tc,
                     log_callback=log,
-                    progress_callback=update_progress
+                    progress_callback=update_progress,
+                    email_list=resume_email_list,
+                    interval=resume_interval,
                 )
                 engine[0].completed_collections = old_count
                 engine[0].resume()
