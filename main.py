@@ -235,7 +235,7 @@ def single_user_task(task_id: int, email: str, user_titles: list, user_intros: l
         long_wait = WebDriverWait(driver, 6000)
 
         driver.get("https://modrinth.com")
-        signup_btn = long_wait.until(EC.element_to_be_clickable((By.XPATH, '//a[@href="/auth/sign-up"]')))
+        signup_btn = long_wait.until(EC.element_to_be_clickable((By.XPATH, '//a[@href="/auth/sign-in?redirect=/"]')))
         if not retry_click(driver, signup_btn):
             raise Exception(f"点击注册按钮失败")
         if log_callback:
@@ -264,45 +264,45 @@ def single_user_task(task_id: int, email: str, user_titles: list, user_intros: l
         if log_callback:
             log_callback(f"[用户{task_id}] 点击 Continue with Email")
 
-        picker_wrap = long_wait.until(EC.element_to_be_clickable((By.CLASS_NAME, "modrinth-date-picker")))
-        if not retry_click(driver, picker_wrap):
-            raise Exception(f"点击日期选择器失败")
-        time.sleep(0.6)
-
-        month_select = long_wait.until(EC.element_to_be_clickable((
-            By.CSS_SELECTOR, "select.modrinth-monthDropdown-months"
-        )))
-        if not retry_click(driver, month_select):
-            raise Exception(f"点击月份选择失败")
-        time.sleep(0.2)
-        august_option = long_wait.until(EC.element_to_be_clickable((
-            By.CSS_SELECTOR, "select.modrinth-monthDropdown-months option[value='7']"
-        )))
-        if not retry_click(driver, august_option):
-            raise Exception(f"选择八月失败")
-        time.sleep(0.3)
-
-        year_input = long_wait.until(EC.presence_of_element_located((
-            By.CSS_SELECTOR, "input.numInput.cur-year"
-        )))
-        year_input.clear()
-        year_input.send_keys("1998")
-        time.sleep(0.3)
-
-        day23 = long_wait.until(EC.element_to_be_clickable((
-            By.XPATH, '//span[@aria-label="August 23, 1998"]'
-        )))
-        if not retry_click(driver, day23):
-            raise Exception(f"选择日期失败")
-        time.sleep(0.4)
-
-        blank_target = long_wait.until(EC.element_to_be_clickable((
-            By.XPATH, "//*[contains(text(), 'Date of birth')]"
-        )))
-        if not retry_click(driver, blank_target):
-            raise Exception(f"点击空白处关闭日期选择器失败")
-        if log_callback:
-            log_callback(f"[用户{task_id}] 生日选择完成")
+        # picker_wrap = long_wait.until(EC.element_to_be_clickable((By.CLASS_NAME, "modrinth-date-picker")))
+        # if not retry_click(driver, picker_wrap):
+        #     raise Exception(f"点击日期选择器失败")
+        # time.sleep(0.6)
+        # 
+        # month_select = long_wait.until(EC.element_to_be_clickable((
+        #     By.CSS_SELECTOR, "select.modrinth-monthDropdown-months"
+        # )))
+        # if not retry_click(driver, month_select):
+        #     raise Exception(f"点击月份选择失败")
+        # time.sleep(0.2)
+        # august_option = long_wait.until(EC.element_to_be_clickable((
+        #     By.CSS_SELECTOR, "select.modrinth-monthDropdown-months option[value='7']"
+        # )))
+        # if not retry_click(driver, august_option):
+        #     raise Exception(f"选择八月失败")
+        # time.sleep(0.3)
+        # 
+        # year_input = long_wait.until(EC.presence_of_element_located((
+        #     By.CSS_SELECTOR, "input.numInput.cur-year"
+        # )))
+        # year_input.clear()
+        # year_input.send_keys("1998")
+        # time.sleep(0.3)
+        # 
+        # day23 = long_wait.until(EC.element_to_be_clickable((
+        #     By.XPATH, '//span[@aria-label="August 23, 1998"]'
+        # )))
+        # if not retry_click(driver, day23):
+        #     raise Exception(f"选择日期失败")
+        # time.sleep(0.4)
+        # 
+        # blank_target = long_wait.until(EC.element_to_be_clickable((
+        #     By.XPATH, "//*[contains(text(), 'Date of birth')]"
+        # )))
+        # if not retry_click(driver, blank_target):
+        #     raise Exception(f"点击空白处关闭日期选择器失败")
+        # if log_callback:
+        #     log_callback(f"[用户{task_id}] 生日选择完成")
 
         hcaptcha_iframe = long_wait.until(
             EC.presence_of_element_located((
