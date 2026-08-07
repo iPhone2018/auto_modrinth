@@ -369,7 +369,7 @@ def single_user_task(task_id: int, email: str, user_titles: list, user_intros: l
 
         pwd_input = long_wait.until(EC.visibility_of_element_located((By.ID, "password")))
         pwd_input.clear()
-        pwd_input.send_keys("zqx1314520.")
+        pwd_input.send_keys("Admin@coc1")
         if log_callback:
             log_callback(f"[用户{task_id}] 输入密码")
 
