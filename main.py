@@ -10,6 +10,7 @@ import time
 import random
 import string
 import socket
+import json
 import requests
 import threading
 import queue
@@ -65,6 +66,7 @@ def unregister_driver(task_id):
 
 
 def close_all_drivers():
+    """立刻全部quit所有浏览器"""
     with _drivers_lock:
         drivers = list(_active_drivers.values())
         _active_drivers.clear()
@@ -110,6 +112,114 @@ def _find_available_port(start_port: int, max_attempts: int = 20) -> int:
         if not _is_port_in_use(port):
             return port
     raise RuntimeError(f"无法找到可用端口，已尝试 {max_attempts} 个端口（从 {start_port} 开始）")
+
+
+# def get_local_chromedriver_path(base_dir: str) -> str:
+#     """读取项目.wdm缓存里已下载的mac-arm64 chromedriver，自动选最新版本"""
+#     wdm_root = Path(base_dir) / ".wdm" / "drivers" / "chromedriver" / "mac-arm64"
+#     if not wdm_root.exists():
+#         raise FileNotFoundError(f"未找到wdm驱动缓存目录：{wdm_root}\n请先下载对应版本chromedriver")
+#
+#     version_dirs = []
+#     for child in wdm_root.iterdir():
+#         if child.is_dir() and child.name.count(".") >= 3:
+#             try:
+#                 ver_tuple = tuple(map(int, child.name.split(".")))
+#                 version_dirs.append((ver_tuple, child))
+#             except ValueError:
+#                 continue
+#
+#     if not version_dirs:
+#         raise FileNotFoundError("wdm缓存内无任何chromedriver版本文件夹")
+#
+#     version_dirs.sort(reverse=True, key=lambda x: x[0])
+#     latest_driver = version_dirs[0][1] / "chromedriver-mac-arm64" / "chromedriver"
+#
+#     if not latest_driver.exists():
+#         raise FileNotFoundError(f"驱动文件缺失：{latest_driver}")
+#     return str(latest_driver)
+#
+#
+# def find_mac_system_chrome() -> str | None:
+#     """自动查找Mac系统自带Chrome可执行文件路径"""
+#     chrome_candidates = [
+#         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+#         "/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta",
+#         "/Applications/Google Chrome Dev.app/Contents/MacOS/Google Chrome Dev",
+#         "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+#     ]
+#     for path in chrome_candidates:
+#         if Path(path).exists():
+#             return path
+#     return None
+#
+#
+# def init_browser(task_id: int):
+#     """
+#     跨平台浏览器初始化
+#     Mac：自动读取系统Chrome + 复用项目.wdm缓存驱动
+#     Windows：使用根目录chromedriver.exe + 项目内chrome便携包
+#     """
+#     if getattr(sys, 'frozen', False):
+#         base_dir = os.path.dirname(os.path.realpath(sys.argv[0]))
+#     else:
+#         base_dir = os.path.dirname(os.path.abspath(__file__))
+#
+#     if sys.platform == "win32":
+#         driver_name = "chromedriver.exe"
+#         local_driver = os.path.join(base_dir, driver_name)
+#         chrome_bin_path = os.path.join(base_dir, "chrome", "chrome.exe")
+#
+#         if not os.path.exists(local_driver):
+#             raise FileNotFoundError(f"找不到 chromedriver.exe，放在程序同级目录\n{local_driver}")
+#         if not os.path.exists(chrome_bin_path):
+#             raise FileNotFoundError(f"找不到便携chrome.exe，chrome文件夹放程序同级\n{chrome_bin_path}")
+#     else:
+#         local_driver = get_local_chromedriver_path(base_dir)
+#         chrome_bin_path = find_mac_system_chrome()
+#         if chrome_bin_path is None:
+#             portable_chrome = os.path.join(base_dir, "chrome", "Chrome")
+#             if os.path.exists(portable_chrome):
+#                 chrome_bin_path = portable_chrome
+#             else:
+#                 raise FileNotFoundError(
+#                     "未检测到系统Google Chrome，同时项目内无便携chrome文件夹\n"
+#                     "解决方法：1.安装系统Chrome；2.在程序根目录放置chrome便携文件夹"
+#                 )
+#         os.chmod(local_driver, 0o755)
+#
+#     options = webdriver.ChromeOptions()
+#     options.binary_location = chrome_bin_path
+#     options.add_argument("--no-sandbox")
+#     options.add_argument("--disable-dev-shm-usage")
+#     options.add_argument("--disable-extensions")
+#     options.add_argument("--disable-background-networking")
+#     options.add_argument("--start-maximized")
+#     options.add_experimental_option("excludeSwitches", ["enable-logging"])
+#     options.add_argument("--disable-animations")
+#     options.add_experimental_option("excludeSwitches", ["enable-automation"])
+#     options.add_experimental_option("useAutomationExtension", False)
+#
+#     # ===== 窗口配置：全屏最大化 =====
+#     options.add_argument("--start-maximized")
+#     # =====================================================
+#
+#     user_data_dir = os.path.join(base_dir, f"chrome_user_data_task_{task_id}")
+#     os.makedirs(user_data_dir, exist_ok=True)
+#     options.add_argument(f"--user-data-dir={user_data_dir}")
+#     debug_port = 9222 + task_id * 10
+#     options.add_argument(f"--remote-debugging-port={debug_port}")
+#
+#     service = Service(local_driver)
+#     driver = webdriver.Chrome(service=service, options=options)
+#     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+#         "source": """
+#             Object.defineProperty(navigator, 'webdriver', {get: () => undefined})
+#         """
+#     })
+#     wait = WebDriverWait(driver, 15)
+#     short_wait = WebDriverWait(driver, 3)
+#     return driver, wait, short_wait
 
 
 def init_browser(task_id):
@@ -164,7 +274,6 @@ def init_browser(task_id):
 
 def retry_click(driver, element, max_retries=3, delay=0.5):
     from selenium.webdriver.common.action_chains import ActionChains
-    last_error = None
     for attempt in range(max_retries):
         try:
             driver.execute_script(
@@ -174,25 +283,16 @@ def retry_click(driver, element, max_retries=3, delay=0.5):
             element.click()
             return True
         except Exception as e1:
-            last_error = e1
             try:
                 ActionChains(driver).move_to_element(element).click().perform()
                 return True
             except Exception as e2:
-                last_error = e2
                 try:
                     driver.execute_script("arguments[0].click();", element)
                     return True
                 except Exception as e3:
-                    last_error = e3
                     time.sleep(delay)
     return False
-
-
-def random_qq_email():
-   # 10位时间戳（秒级）
-   prefix = str(int(time.time()))
-   return f"{prefix}@qq.com"
 
 
 def display_width(text):
@@ -213,36 +313,55 @@ def append_link_to_txt(link: str, file_path: str = "links.txt"):
             f.write(link + "\n")
 
 
+# === Modified：增加stop_event，子任务可以接收停止信号 ===
 def single_user_task(task_id: int, email: str, user_titles: list, user_intros: list,
-                     output_dir: str, interval: float = 0, log_callback=None, on_collection_created=None):
+                     output_dir: str, interval: float, stop_event: Event, log_callback=None,
+                     on_collection_created=None):
     driver = None
     session = None
     token = None
     success_count = 0
 
+    def _check_stop():
+        """一旦收到停止信号直接抛出，跳出所有逻辑，进入finally"""
+        if stop_event.is_set():
+            raise InterruptedError("收到停止信号，立即终止当前用户会话")
+
     try:
+        _check_stop()
         if log_callback:
             log_callback(f"[用户{task_id}] ===== 任务开始 =====")
             log_callback(f"[用户{task_id}] 需要创建收藏夹: {len(user_titles)} 个")
             log_callback(f"[用户{task_id}] 启动浏览器，准备注册...")
 
+        _check_stop()
         if log_callback:
             log_callback(f"[用户{task_id}] 初始化 Chrome 浏览器...")
         driver, wait, short_wait = init_browser(task_id)
         register_driver(task_id, driver)
+        _check_stop()
         if log_callback:
             log_callback(f"[用户{task_id}] 浏览器初始化成功")
         long_wait = WebDriverWait(driver, 6000)
 
         driver.get("https://modrinth.com")
-        signup_btn = long_wait.until(EC.element_to_be_clickable((By.XPATH, '//a[@href="/auth/sign-in?redirect=/"]')))
-        if not retry_click(driver, signup_btn):
-            raise Exception(f"点击注册按钮失败")
-        if log_callback:
-            log_callback(f"[用户{task_id}] 点击注册按钮")
+        _check_stop()
+        # 等待header区域出现，代表桌面版导航栏渲染
+        long_wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "header.desktop-only")))
+
+        # 精准定位：header.desktop-only 右侧，带log‑in图标的Sign in按钮
+        sign_in_btn = long_wait.until(
+            EC.element_to_be_clickable((
+                By.CSS_SELECTOR,
+                'header.desktop-only > div.flex.items-center.gap-1 a[data-button]:has(svg.lucide-log-in)'
+            ))
+        )
+
+        # 优先JS点击，绕过selenium合成鼠标事件
+        driver.execute_script("arguments[0].click();", sign_in_btn)
+        _check_stop()
 
         email_input = long_wait.until(EC.visibility_of_element_located((By.ID, "email")))
-        # random_email = random_qq_email()
         email_input.clear()
         email_input.send_keys(email)
         if log_callback:
@@ -250,89 +369,42 @@ def single_user_task(task_id: int, email: str, user_titles: list, user_intros: l
 
         pwd_input = long_wait.until(EC.visibility_of_element_located((By.ID, "password")))
         pwd_input.clear()
-        pwd_input.send_keys("Admin@coc1")
+        pwd_input.send_keys("zqx1314520.")
         if log_callback:
             log_callback(f"[用户{task_id}] 输入密码")
 
-        continue_btn = long_wait.until(
-            EC.element_to_be_clickable(
-                (By.XPATH, "//button[contains(text(), 'Continue with Email')]")
+        # 1.等待hCaptcha iframe出现（主文档）
+        iframe = long_wait.until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, 'iframe[src*="newassets.hcaptcha.com"][src*="frame=checkbox"]')
             )
         )
-        if not retry_click(driver, continue_btn):
-            raise Exception(f"点击 Continue with Email 失败")
-        if log_callback:
-            log_callback(f"[用户{task_id}] 点击 Continue with Email")
 
-        # picker_wrap = long_wait.until(EC.element_to_be_clickable((By.CLASS_NAME, "modrinth-date-picker")))
-        # if not retry_click(driver, picker_wrap):
-        #     raise Exception(f"点击日期选择器失败")
-        # time.sleep(0.6)
-        # 
-        # month_select = long_wait.until(EC.element_to_be_clickable((
-        #     By.CSS_SELECTOR, "select.modrinth-monthDropdown-months"
-        # )))
-        # if not retry_click(driver, month_select):
-        #     raise Exception(f"点击月份选择失败")
-        # time.sleep(0.2)
-        # august_option = long_wait.until(EC.element_to_be_clickable((
-        #     By.CSS_SELECTOR, "select.modrinth-monthDropdown-months option[value='7']"
-        # )))
-        # if not retry_click(driver, august_option):
-        #     raise Exception(f"选择八月失败")
-        # time.sleep(0.3)
-        # 
-        # year_input = long_wait.until(EC.presence_of_element_located((
-        #     By.CSS_SELECTOR, "input.numInput.cur-year"
-        # )))
-        # year_input.clear()
-        # year_input.send_keys("1998")
-        # time.sleep(0.3)
-        # 
-        # day23 = long_wait.until(EC.element_to_be_clickable((
-        #     By.XPATH, '//span[@aria-label="August 23, 1998"]'
-        # )))
-        # if not retry_click(driver, day23):
-        #     raise Exception(f"选择日期失败")
-        # time.sleep(0.4)
-        # 
-        # blank_target = long_wait.until(EC.element_to_be_clickable((
-        #     By.XPATH, "//*[contains(text(), 'Date of birth')]"
-        # )))
-        # if not retry_click(driver, blank_target):
-        #     raise Exception(f"点击空白处关闭日期选择器失败")
-        # if log_callback:
-        #     log_callback(f"[用户{task_id}] 生日选择完成")
+        # 切入iframe！非常关键
+        driver.switch_to.frame(iframe)
 
-        hcaptcha_iframe = long_wait.until(
-            EC.presence_of_element_located((
-                By.CSS_SELECTOR,
-                "iframe[src*='newassets.hcaptcha.com'][src*='frame=checkbox']"
-            ))
-        )
-
-        print(f"[hCaptcha] 发现 checkbox iframe")
-        driver.switch_to.frame(hcaptcha_iframe)
-        print("[hCaptcha] 已切换到 iframe 内部")
-
+        # 现在在iframe内部，才可以拿到 #checkbox
         checkbox = long_wait.until(
-            EC.presence_of_element_located((By.ID, "checkbox"))
+            EC.element_to_be_clickable((By.ID, "checkbox"))
         )
+
+        # 滚动到可视区域（iframe内部滚动）
         driver.execute_script(
             "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
             checkbox
         )
-        time.sleep(0.3)
+        time.sleep(0.4)
+
         print(f"[hCaptcha] 点击前 aria-checked: {checkbox.get_attribute('aria-checked')}")
 
-        actions = ActionChains(driver)
-        actions.move_to_element(checkbox)
-        actions.click()
-        actions.perform()
-        print("✅ [hCaptcha] ActionChains 点击完成")
+        # 优先JS点击，iframe内ActionChains经常失效
+        driver.execute_script("arguments[0].click();", checkbox)
+        print("✅ [hCaptcha] iframe内JS点击checkbox完成")
 
+        # 切回主页面，交给你后面的轮询检测逻辑
         driver.switch_to.default_content()
-        print("[hCaptcha] 已切回主文档")
+        print("[hCaptcha] 已切回主文档，开始轮询检测验证状态")
+
         print("\n⏳ 等待手动完成 hCaptcha 验证...")
 
         max_wait_time = 600
@@ -341,68 +413,55 @@ def single_user_task(task_id: int, email: str, user_titles: list, user_intros: l
         verified = False
 
         while elapsed < max_wait_time:
+            _check_stop()  # 等待人机验证的循环也要检测停止信号
             time.sleep(poll_interval)
             elapsed += poll_interval
 
             try:
-                checkbox_iframes = driver.find_elements(
-                    By.CSS_SELECTOR,
-                    "iframe[src*='newassets.hcaptcha.com'][src*='frame=checkbox']"
-                )
-
-                if checkbox_iframes:
-                    driver.switch_to.frame(checkbox_iframes[0])
-                    try:
-                        cb = driver.find_element(By.ID, "checkbox")
-                        if cb.get_attribute("aria-checked") == "true":
-                            verified = True
-                    except:
-                        pass
-                    driver.switch_to.default_content()
-                else:
-                    challenge_iframes = driver.find_elements(
-                        By.CSS_SELECTOR,
-                        "iframe[src*='newassets.hcaptcha.com'][src*='frame=challenge']"
-                    )
-                    if not challenge_iframes:
+                resp_textareas = driver.find_elements(By.CSS_SELECTOR, "textarea[name='h-captcha-response']")
+                if resp_textareas:
+                    token_val = resp_textareas[0].get_attribute("value")
+                    if token_val and len(token_val.strip()) > 20:
                         verified = True
-                    else:
-                        if int(elapsed) % 10 == 0 and log_callback:
-                            log_callback(f"[用户{task_id}]    ...等待完成图片挑战...")
-                        driver.switch_to.default_content()
-                        continue
 
                 if verified:
                     if log_callback:
-                        log_callback(f"[用户{task_id}] ✅ hCaptcha 验证通过!")
+                        log_callback(f"[用户{task_id}] ✅ hCaptcha 检测到有效token，验证通过!")
                     break
 
-            except Exception as e:
-                driver.switch_to.default_content()
-                pass
-
-            if int(elapsed) % 10 == 0 and log_callback:
-                log_callback(f"[用户{task_id}]    ...已等待 {int(elapsed)} 秒，请手动点击验证框...")
-
+            except Exception:
+                try:
+                    driver.switch_to.default_content()
+                except:
+                    pass
         else:
             raise TimeoutError("hCaptcha 验证等待超时（5分钟未检测到通过）")
 
-        keep_check = long_wait.until(
-            EC.element_to_be_clickable((By.XPATH, '//span[contains(@class, "checkbox-shadow")]'))
+        _check_stop()
+        continue_btn = long_wait.until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//button[normalize-space()='Continue with Email']")
+            )
         )
-        if not retry_click(driver, keep_check):
-            raise Exception(f"勾选邮件订阅失败")
 
-        finish_register_btn = long_wait.until(
-            EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Complete sign up')]"))
-        )
-        if not retry_click(driver, finish_register_btn):
-            raise Exception(f"点击完成注册按钮失败")
+        for _ in range(20):
+            _check_stop()
+            aria_disabled = continue_btn.get_attribute("aria-disabled")
+            if aria_disabled != "true":
+                break
+            time.sleep(0.25)
+        else:
+            raise TimeoutError("Continue with Email 按钮长时间处于禁用状态，hCaptcha可能未生效")
+
+        driver.execute_script("arguments[0].click();", continue_btn)
         if log_callback:
-            log_callback(f"[用户{task_id}] 注册完成!")
+            log_callback(f"[用户{task_id}] ✅ 点击 Continue with Email")
+
         time.sleep(5)
+        _check_stop()
 
         for attempt in range(5):
+            _check_stop()
             cookies = driver.get_cookies()
             for ck in cookies:
                 if ck["name"] == "auth-token":
@@ -412,7 +471,7 @@ def single_user_task(task_id: int, email: str, user_titles: list, user_intros: l
                 if log_callback:
                     log_callback(f"[用户{task_id}] 获取 Token 成功")
                 break
-            if attempt < 4:  # 前4次失败才等待
+            if attempt < 4:
                 time.sleep(5)
         else:
             raise Exception("无法获取 auth-token")
@@ -433,7 +492,9 @@ def single_user_task(task_id: int, email: str, user_titles: list, user_intros: l
         })
 
         collection_ids = []
+        # === Modified：创建收藏夹循环内每次迭代检测停止信号 ===
         for i, (title, intro) in enumerate(zip(user_titles, user_intros)):
+            _check_stop()
             if log_callback:
                 log_callback(f"[用户{task_id}] 创建收藏夹 {i + 1}/{len(user_titles)}: {title[:30]}...")
 
@@ -444,6 +505,7 @@ def single_user_task(task_id: int, email: str, user_titles: list, user_intros: l
             }
             resp = session.post("https://api.modrinth.com/v3/collection", json=create_payload)
             time.sleep(random.uniform(0.1, 0.5))
+            _check_stop()
 
             if resp.status_code == 200:
                 collection_id = resp.json()["id"]
@@ -458,6 +520,7 @@ def single_user_task(task_id: int, email: str, user_titles: list, user_intros: l
                 if log_callback:
                     log_callback(f"[用户{task_id}] 创建收藏夹失败: {resp.status_code} - {resp.text}")
 
+        _check_stop()
         if log_callback:
             log_callback(f"[用户{task_id}] 搜索热门模组...")
         search_resp = session.get(
@@ -465,6 +528,7 @@ def single_user_task(task_id: int, email: str, user_titles: list, user_intros: l
             params={"limit": 20, "index": "relevance", "new_filters": "project_types = `mod`"}
         )
         time.sleep(random.uniform(0.1, 0.5))
+        _check_stop()
 
         if search_resp.status_code == 200:
             hits = search_resp.json().get("hits", [])
@@ -475,6 +539,7 @@ def single_user_task(task_id: int, email: str, user_titles: list, user_intros: l
                     log_callback(f"[用户{task_id}] 已关注项目: {target_id}")
 
                 for cid in collection_ids:
+                    _check_stop()
                     update_resp = session.patch(
                         f"https://api.modrinth.com/v3/collection/{cid}",
                         json={"new_projects": [target_id]}
@@ -486,10 +551,18 @@ def single_user_task(task_id: int, email: str, user_titles: list, user_intros: l
                         if log_callback:
                             log_callback(f"[用户{task_id}] 项目已加入收藏夹: {cid}")
 
+        _check_stop()
         if log_callback:
             log_callback(f"[用户{task_id}] 全部完成! 创建了 {success_count} 个收藏夹")
         return f"用户{task_id} 成功 {success_count}/{len(user_titles)}"
 
+    except InterruptedError as ie:
+        msg = f"[用户{task_id}] ✋ {str(ie)}"
+        if log_callback:
+            log_callback(msg)
+        else:
+            print(msg)
+        return f"用户{task_id} 被外部停止: {str(ie)}"
     except Exception as e:
         error_msg = f"[用户{task_id}] 错误: {str(e)}"
         if log_callback:
@@ -499,20 +572,21 @@ def single_user_task(task_id: int, email: str, user_titles: list, user_intros: l
         return f"用户{task_id} 失败: {str(e)}"
     finally:
         unregister_driver(task_id)
+        # === 无论成功、异常、被中断，都执行登出会话 ===
         if session and token:
             try:
-                session.delete(f"https://api.modrinth.com/v2/session/{token}")
-            except:
+                session.delete(f"https://api.modrinth.com/v2/session/{token}", timeout=3)
+            except Exception:
                 pass
         if session:
             try:
                 session.close()
-            except:
+            except Exception:
                 pass
         if driver:
             try:
                 driver.quit()
-            except:
+            except Exception:
                 pass
         try:
             base_dir = os.path.dirname(os.path.realpath(sys.argv[0])) if getattr(sys, 'frozen',
@@ -520,7 +594,7 @@ def single_user_task(task_id: int, email: str, user_titles: list, user_intros: l
                 os.path.abspath(__file__))
             user_data_dir = os.path.join(base_dir, f"chrome_user_data_task_{task_id}")
             _cleanup_chrome_locks(user_data_dir)
-        except:
+        except Exception:
             pass
 
 
@@ -558,6 +632,7 @@ class ModrinthCollector:
                 return
             self._is_running = True
             self.stop_event.clear()
+            self.pause_event.clear()
 
         try:
             self._log("=" * 60)
@@ -690,6 +765,7 @@ class ModrinthCollector:
                     self.email_index += 1
 
                     self._log(f"   [提交] 用户 #{next_user_idx} - {len(titles)} 个收藏夹")
+                    # === Modified：把stop_event传给任务函数 ===
                     future = executor.submit(
                         single_user_task,
                         task_id=next_user_idx,
@@ -698,6 +774,7 @@ class ModrinthCollector:
                         user_titles=titles,
                         user_intros=intros,
                         output_dir=self.output_dir,
+                        stop_event=self.stop_event,
                         log_callback=self.log_callback,
                         on_collection_created=on_collection_created
                     )
@@ -705,10 +782,9 @@ class ModrinthCollector:
                     time.sleep(2)
 
                 self._log("   收到停止信号，终止提交新任务")
-                for f in list(futures.keys()):
-                    f.cancel()
+                # 不能cancel正在运行的线程，设置event让子线程内部自行中断
                 close_all_drivers()
-                self._log("   已关闭所有浏览器")
+                self._log("   已调用close_all_drivers，全部浏览器强制退出，子任务将自行执行会话登出")
 
             self._log("\n" + "=" * 60)
             self._log("✅ 任务结束")
@@ -723,18 +799,18 @@ class ModrinthCollector:
         self.stop_event.set()
         self.pause_event.set()
         close_all_drivers()
-        self._log("🛑 已停止")
+        self._log("🛑 stop触发：设置停止事件，强制关闭所有浏览器，子任务会自动登出会话")
 
     def pause(self):
-        self.stop_event.set()
-        self.pause_event.set()
-        close_all_drivers()
-        self._log("⏸ 已暂停，关闭所有浏览器...")
+        """暂停等价于完全停止，移除原来复杂的resume重建逻辑"""
+        self.stop()
+        self._log("⏸ pause触发：已执行stop，全部会话退出，浏览器关闭")
 
     def resume(self):
+        """resume不再做任何内部重启，交给GUI层重新run"""
         self.stop_event.clear()
         self.pause_event.clear()
-        self._log("▶ 继续运行")
+        self._log("▶ resume准备，等待GUI调用run重新启动")
 
 
 def load_emails_from_dir(email_dir: str):
@@ -764,6 +840,29 @@ def load_emails_from_dir(email_dir: str):
     return result
 
 
+CONFIG_FILE = "modrinth_gui_config.json"
+
+
+def load_gui_config():
+    """加载上次界面配置"""
+    if not os.path.exists(CONFIG_FILE):
+        return {}
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_gui_config(cfg):
+    """保存界面配置到json"""
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
 def run_gui():
     root = tk.Tk()
     root.title("Modrinth 批量注册工具")
@@ -784,6 +883,18 @@ def run_gui():
     title_check_vars = {}
     intro_check_vars = {}
 
+    # ========== 加载历史配置 ==========
+    saved_cfg = load_gui_config()
+    title_dir_var.set(saved_cfg.get("title_dir", ""))
+    intro_dir_var.set(saved_cfg.get("intro_dir", ""))
+    output_dir_var.set(saved_cfg.get("output_dir", ""))
+    email_dir_var.set(saved_cfg.get("email_dir", ""))
+    interval_var.set(saved_cfg.get("interval", "5"))
+    saved_thread = saved_cfg.get("thread_count", 3)
+    # 新增：读取上次勾选的文件名（不带后缀）
+    saved_selected_titles = saved_cfg.get("selected_title_files", [])
+    saved_selected_intros = saved_cfg.get("selected_intro_files", [])
+
     def log(msg):
         log_queue.put(msg)
 
@@ -791,9 +902,33 @@ def run_gui():
         log_queue.put(("progress", data))
 
     def on_closing():
+        """窗口关闭：先保存当前界面配置，再stop引擎"""
+        # 提取当前勾选的文件名（无后缀）用于持久化
+        curr_selected_titles = []
+        for disp_name, (var, _) in title_check_vars.items():
+            if var.get() == 1:
+                curr_selected_titles.append(disp_name)
+
+        curr_selected_intros = []
+        for disp_name, (var, _) in intro_check_vars.items():
+            if var.get() == 1:
+                curr_selected_intros.append(disp_name)
+
+        current_config = {
+            "title_dir": title_dir_var.get(),
+            "intro_dir": intro_dir_var.get(),
+            "output_dir": output_dir_var.get(),
+            "email_dir": email_dir_var.get(),
+            "interval": interval_var.get(),
+            "thread_count": int(thread_spin.get()),
+            "selected_title_files": curr_selected_titles,
+            "selected_intro_files": curr_selected_intros
+        }
+        save_gui_config(current_config)
+
         if engine[0]:
             engine[0].stop()
-        root.destroy()
+        root.after(300, root.destroy)
 
     root.protocol("WM_DELETE_WINDOW", on_closing)
 
@@ -816,7 +951,7 @@ def run_gui():
     tk.Label(thread_frame, text="(同时打开的最大浏览器数量，建议 1~6)", font=("微软雅黑", 9), fg="#666").pack(
         side=tk.LEFT)
     thread_spin.delete(0, tk.END)
-    thread_spin.insert(0, "3")
+    thread_spin.insert(0, str(saved_thread))
 
     # ===== 发布间隔 =====
     interval_frame = tk.Frame(cfg)
@@ -950,6 +1085,12 @@ def run_gui():
             full_path = os.path.join(directory, fname)
             title_check_vars[display_name] = (var, full_path)
 
+            # 恢复上次勾选状态
+            if display_name in saved_selected_titles:
+                var.set(1)
+                if full_path not in title_list:
+                    title_list.append(full_path)
+
             cb = tk.Checkbutton(
                 title_scrollable_frame,
                 text=f"  {display_name}",
@@ -964,6 +1105,10 @@ def run_gui():
                 command=lambda dn=display_name: on_title_toggle(dn)
             )
             cb.pack(fill=tk.X, padx=5, pady=2)
+
+        # 刷新底部文本框
+        title_input.delete("1.0", tk.END)
+        title_input.insert(tk.END, "\n".join(title_list))
 
     def on_title_toggle(display_name):
         var, full_path = title_check_vars[display_name]
@@ -1000,6 +1145,12 @@ def run_gui():
             full_path = os.path.join(directory, fname)
             intro_check_vars[display_name] = (var, full_path)
 
+            # 恢复上次勾选状态
+            if display_name in saved_selected_intros:
+                var.set(1)
+                if full_path not in intro_list:
+                    intro_list.append(full_path)
+
             cb = tk.Checkbutton(
                 intro_scrollable_frame,
                 text=f"  {display_name}",
@@ -1014,6 +1165,10 @@ def run_gui():
                 command=lambda dn=display_name: on_intro_toggle(dn)
             )
             cb.pack(fill=tk.X, padx=5, pady=2)
+
+        # 刷新底部文本框
+        intro_input.delete("1.0", tk.END)
+        intro_input.insert(tk.END, "\n".join(intro_list))
 
     def on_intro_toggle(display_name):
         var, full_path = intro_check_vars[display_name]
@@ -1229,6 +1384,13 @@ def run_gui():
     add_log("请依次选择：标题目录 -> 简介目录 -> 输出目录")
     add_log("勾选需要的文件后，点击「启动」开始")
     refresh()
+
+    # 程序启动完毕，如果配置里保存了目录，自动刷新列表恢复勾选
+    if title_dir_var.get() and os.path.isdir(title_dir_var.get()):
+        refresh_title_list(title_dir_var.get())
+    if intro_dir_var.get() and os.path.isdir(intro_dir_var.get()):
+        refresh_intro_list(intro_dir_var.get())
+
     root.mainloop()
 
 
